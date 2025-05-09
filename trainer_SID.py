@@ -52,6 +52,13 @@ class SID_Trainer(Base_Trainer):
 
         self.net = self.net.to(self.device)
         self.loss = Unet_Loss()
+        # 添加感知损失
+        if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
+            self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+        
+        # 添加梯度损失
+        if 'gradient' in self.args['loss'] and self.args['loss']['gradient']:
+            self.gradient_loss = GradientLoss().to(self.device)
         self.corrector = IlluminanceCorrect()
         torch.backends.cudnn.benchmark = True
         # model log
@@ -117,17 +124,39 @@ class SID_Trainer(Base_Trainer):
                 for k, data in enumerate(self.dataloader_train):
                     runtime['dataloader'] += timestamp(time_points, 1)
                     # Preprocess
-                    imgs_lr, imgs_hr, ratio = self.preprocess(data, mode='train', preprocess=True)
+                    imgs_lr, imgs_hr, ratio, noise_map = self.preprocess(data, mode='train', preprocess=True)
                     runtime['preprocess'] += timestamp(time_points, 2)
                     
                     # 训练
                     self.optimizer.zero_grad()
-                    pred = self.net(imgs_lr)
+                    if noise_map is not None:
+                        outputs = self.net(imgs_lr, noise_map)
+                        # 检查输出格式
+                        if isinstance(outputs, tuple) and len(outputs) == 4:
+                            main_output, texture_mask, detail_output, denoise_output = outputs
+                        else:
+                            main_output = outputs
+                            texture_mask, detail_output, denoise_output = None, None, None
+                            
+                        # 如果去噪没提前线性提亮，算loss的时候提亮上去
+                        if self.dst['ori'] is True:
+                            main_output = main_output * ratio
+                            if detail_output is not None:
+                                detail_output = detail_output * ratio
+                            if denoise_output is not None:
+                                denoise_output = denoise_output * ratio
+                        
+                        pred = main_output
+                                
+                        # 计算多损失
+                        loss = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
+                    else:
+                        pred = self.net(imgs_lr)
+                        # 极暗，乘上去
+                        if self.dst['ori'] is True:
+                            pred = pred * ratio
+                        loss = self.loss(pred.clamp(0,1), imgs_hr)
                     runtime['net'] += timestamp(time_points, 3)
-                    # 极暗，乘上去
-                    if self.dst['ori'] is True:
-                        pred = pred * ratio
-                    loss = self.loss(pred.clamp(0,1), imgs_hr)
                     loss.backward()
                     self.optimizer.step()
                     runtime['bp'] += timestamp(time_points, 4)
@@ -233,7 +262,7 @@ class SID_Trainer(Base_Trainer):
         with tqdm(total=len(self.dataloader_eval)) as t:
             for k, data in enumerate(self.dataloader_eval):
                 # 由于crops的存在，Dataloader会把数据变成5维，需要view回4维
-                imgs_lr, imgs_hr, ratio = self.preprocess(data, mode='eval', preprocess=False)
+                imgs_lr, imgs_hr, ratio, noise_map = self.preprocess(data, mode='eval', preprocess=False)
                 wb = data['wb'][0].numpy()
                 ccm = data['ccm'][0].numpy()
                 name = data['name'][0]
@@ -257,11 +286,28 @@ class SID_Trainer(Base_Trainer):
                     if imgs_lr.shape[-1] % 16 != 0:
                         p2d = (4,4,4,4)
                         imgs_lr = F.pad(imgs_lr, p2d, mode='reflect')
-                        imgs_dn = self.net(imgs_lr)
+                        if noise_map is not None:
+                            imgs_dn = self.net(imgs_lr, noise_map)
+                        else:
+                            imgs_dn = self.net(imgs_lr)
+
+                        if isinstance(imgs_dn, tuple) and len(imgs_dn) == 4:
+                            imgs_dn, texture_mask, detail_output, denoise_output = imgs_dn
+                        else:
+                            imgs_dn = imgs_dn
+
                         imgs_lr = imgs_lr[..., 4:-4, 4:-4]
                         imgs_dn = imgs_dn[..., 4:-4, 4:-4]
                     else:
-                        imgs_dn = self.net(imgs_lr)
+                        if noise_map is not None:
+                            imgs_dn = self.net(imgs_lr, noise_map)
+                        else:
+                            imgs_dn = self.net(imgs_lr)
+
+                        if isinstance(imgs_dn, tuple) and len(imgs_dn) == 4:
+                            imgs_dn, texture_mask, detail_output, denoise_output = imgs_dn
+                        else:
+                            imgs_dn = imgs_dn
                     
                     # brighten
                     if self.dst['ori']:
@@ -374,7 +420,7 @@ class SID_Trainer(Base_Trainer):
         #     target = np.load(self.infos[k]['path_npy_gt'])
         output = raw2rgb_rawpy(imgs_dn, wb=wb, ccm=ccm)
         
-        psnr, ssim = plot_sample(inputs, output, target, 
+        psnr, ssim, _ = plot_sample(inputs, output, target, 
                         filename=name, 
                         save_plot=save_plot, epoch=epoch,
                         model_name=self.model_name,
@@ -408,6 +454,12 @@ class SID_Trainer(Base_Trainer):
         imgs_lr = tensor_dim5to4(data['lr']).type(torch.FloatTensor).to(self.device)
         # self.use_gpu = True
         dst = self.dst_train if mode=='train' else self.dst_eval
+
+        # 处理噪声图(如果存在)
+        noise_map = None
+        if 'noise_map' in data:
+            noise_map = tensor_dim5to4(data['noise_map']).type(torch.FloatTensor).to(self.device)
+            data['noise_map'] = noise_map
 
         if self.use_gpu and mode=='train' and preprocess:
             b = imgs_lr.shape[0]
@@ -457,7 +509,40 @@ class SID_Trainer(Base_Trainer):
             lb = -100 if 'HB' in self.dst['command'] else 0
             imgs_lr = imgs_lr.clamp(lb, 1)
             imgs_hr = imgs_hr.clamp(0, 1)
-        return imgs_lr, imgs_hr, ratio
+        return imgs_lr, imgs_hr, ratio, noise_map
+    
+    def compute_multi_loss(self, main_output, detail_output, denoise_output, gt):
+
+        total_loss = 0
+        
+        # 主输出损失 - 使用普通的L1损失
+        main_loss = self.loss(main_output.clamp(0,1), gt)
+        total_loss += main_loss
+        
+        # 记录详细损失值用于日志（可选）
+        loss_values = {'main_loss': main_loss.item()}
+        
+        # 细节路径中间监督 - 使用perceptual loss和gradient loss
+        if detail_output is not None:
+            # 可以添加VGG感知损失，需要先初始化
+            if hasattr(self, 'perceptual_loss'):
+                detail_percep_loss = self.perceptual_loss(detail_output.clamp(0,1), gt)
+                total_loss += detail_percep_loss * 0.1  # 权重可调
+                loss_values['detail_percep_loss'] = detail_percep_loss.item()
+                
+            # 添加梯度损失
+            if hasattr(self, 'gradient_loss'):
+                detail_grad_loss = self.gradient_loss(detail_output.clamp(0,1), gt)
+                total_loss += detail_grad_loss * 0.5  # 权重可调
+                loss_values['detail_grad_loss'] = detail_grad_loss.item()
+        
+        # 降噪路径中间监督 - 使用L1损失
+        if denoise_output is not None:
+            denoise_loss = self.loss(denoise_output.clamp(0,1), gt)
+            total_loss += denoise_loss * 0.5  # 权重可调
+            loss_values['denoise_loss'] = denoise_loss.item()
+        
+        return total_loss
 
 def MultiProcessPlot(imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch, 
                     raw_metrics, infos, model_name, sample_dir):
@@ -476,6 +561,7 @@ def MultiProcessPlot(imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch,
                     save_path=sample_dir,
                     res=raw_metrics)
     return psnr, ssim
+
 
 if __name__ == '__main__':
     trainer = SID_Trainer()

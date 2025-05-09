@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import torchvision.models as models
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 Sobel = np.array([[-1,-2,-1],
@@ -276,3 +277,111 @@ class GAN_Loss(nn.Module):
             loss_G = errG
         
         return loss_D, loss_G
+    
+class VGGPerceptualLoss(nn.Module):
+    # VGG-based perceptual loss
+    def __init__(self, layer_weights={'conv1_2': 0.1, 'conv2_2': 0.1,
+                                      'conv3_4': 0.1, 'conv4_4': 0.1, 'conv5_4': 0.1},
+                 vgg_type='vgg19', loss_weight=1.0, normalize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        self.layer_weights = layer_weights
+        self.loss_weight = loss_weight
+        self.normalize = normalize
+
+        # load pretrained VGG model
+        if vgg_type == 'vgg19':
+            vgg = models.vgg19(pretrained=True).features
+        elif vgg_type == 'vgg16':
+            vgg = models.vgg16(pretrained=True).features
+        else:
+            raise ValueError(f'Unsupported VGG type: {vgg_type}')
+
+        self.vgg_layers = {
+            'conv1_2': 4,
+            'conv2_2': 9,
+            'conv3_4': 18,
+            'conv4_4': 27,
+            'conv5_4': 36
+        }
+
+        # create VGG feature extractor
+        self.vgg_extractors = nn.ModuleDict()
+        for layer_name in self.layer_weights:
+            if layer_name not in self.vgg_layers:
+                raise ValueError(f'Unsupported layer name: {layer_name}')
+            self.vgg_extractors[layer_name] = nn.Sequential(
+                *list(vgg.children())[:(self.vgg_layers[layer_name] + 1)])
+
+        # freeze VGG parameters
+        for extractor in self.vgg_extractors.values():
+            for param in extractor.parameters():
+                param.requires_grad = False
+
+        # register mean and std
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def _preprocess(self, x):
+        # preprocess input image
+        if x.shape[1] == 4:
+            # convert to RGB format
+            r = x[:, 0:1]
+            g = (x[:, 1:2] + x[:, 2:3]) / 2
+            b = x[:, 3:4]
+            x = torch.cat([r, g, b], dim=1)
+
+        if self.normalize:
+            x = (x - self.mean) / self.std
+        return x
+
+    def forward(self, pred, target):
+        # preprocess input images
+        pred = torch.clamp(pred, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
+
+        pred = self._preprocess(pred)
+        target = self._preprocess(target)
+
+        # extract features
+        pred_features = {layer_name: self.vgg_extractors[layer_name](pred)
+                         for layer_name in self.layer_weights}
+        target_features = {layer_name: self.vgg_extractors[layer_name](target)
+                           for layer_name in self.layer_weights}
+
+        # compute perceptual loss
+        loss = 0
+        for layer_name, weight in self.layer_weights.items():
+            loss += weight * F.mse_loss(pred_features[layer_name], target_features[layer_name])
+        return loss * self.loss_weight
+    
+class GradientLoss(nn.Module):
+    """Gradient/edge-preserving loss"""
+    def __init__(self, loss_weight=1.0):
+        super(GradientLoss, self).__init__()
+        self.loss_weight = loss_weight
+
+        # create Sobel operator
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                              dtype=torch.float32).reshape(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                              dtype=torch.float32).reshape(1, 1, 3, 3)
+
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+    def forward(self, pred, target):
+        # ensure the input is in the correct shape
+        b, c, h, w = pred.shape
+        pred_gray = pred.mean(dim=1, keepdim=True)
+        target_gray = target.mean(dim=1, keepdim=True)
+
+        # apply Sobel operator
+        grad_x_pred = F.conv2d(pred_gray, self.sobel_x, padding=1)
+        grad_y_pred = F.conv2d(pred_gray, self.sobel_y, padding=1)
+        grad_x_target = F.conv2d(target_gray, self.sobel_x, padding=1)
+        grad_y_target = F.conv2d(target_gray, self.sobel_y, padding=1)
+
+        # calculate L1 loss
+        loss = F.l1_loss(grad_x_pred, grad_x_target) + F.l1_loss(grad_y_pred, grad_y_target)
+
+        return loss * self.loss_weight

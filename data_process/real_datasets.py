@@ -1,7 +1,6 @@
 import pickle
 import torch
 import numpy as np
-import cv2
 import os
 import h5py
 import rawpy
@@ -11,6 +10,7 @@ from tqdm import tqdm
 from .unprocess import *
 from .process import *
 from utils import *
+from .noise_map import generate_noise_map, load_camera_params
 
 class RealBase_Dataset(Dataset):
     def __init__(self, args=None):
@@ -20,6 +20,15 @@ class RealBase_Dataset(Dataset):
         if args is not None:
             for key in args:
                 self.args[key] = args[key]
+
+        self.use_noise_map = self.args.get('use_noise_map', False)
+        if self.use_noise_map:
+            # 加载相机参数
+            camera_params_file = self.args.get('camera_params_file', 'resources/camera_params/camera_params.yaml')
+            self.camera_params = load_camera_params(camera_params_file)
+            self.camera_name = self.args.get('camera_type', 'SonyA7S2')
+            if not self.camera_params or self.camera_name not in self.camera_params:
+                print(f"Warning: Camera parameters for {self.camera_name} not found, noise map may be inaccurate")
         # self.initialization() # 基类不调用
     
     def default_args(self):
@@ -35,6 +44,35 @@ class RealBase_Dataset(Dataset):
         self.args['wp'] = 16383
         self.args['bl'] = 512
         self.args['clip'] = False
+        self.args['use_noise_map'] = False
+        self.args['camera_params_file'] = 'resources/camera_params/camera_params.yaml'
+    
+    def generate_noise_map(self, image, iso, noise_params=None):
+        """
+        生成噪声图，支持numpy数组和PyTorch张量
+        
+        Args:
+            image: 输入图像
+            iso: ISO值
+            noise_params: 噪声参数(可选)
+            
+        Returns:
+            noise_map: 噪声图，与输入图像相同形状
+        """
+        if not self.use_noise_map:
+            return None
+            
+        # 优先使用噪声参数(训练时可能有)
+        if noise_params is not None and self.args["mode"] == 'train':
+            return generate_noise_map(image=image, noise_params=noise_params)
+        
+        # 否则使用相机参数和ISO值(测试时使用)
+        return generate_noise_map(
+            image=image, 
+            camera_params=self.camera_params,
+            iso=iso,
+            camera_name=self.camera_name
+        )
 
     def initialization(self):
         # 获取数据地址
@@ -382,7 +420,29 @@ class SID_Dataset(RealBase_Dataset):
 
         data["lr"] = np.ascontiguousarray(lr_crops)
         data["hr"] = np.ascontiguousarray(hr_crops)
-        
+
+        if self.use_noise_map:
+            noise_params = None
+            if self.args["mode"] == 'train' and 'darkshading2' in self.args['command']:
+                if hasattr(self, 'noiseparam') and data['ISO'] in self.noiseparam:
+                    noise_params = {
+                        'shot': self.noiseparam[data['ISO']]['Kmax'],
+                        'read': {
+                            'sigma': self.noiseparam[data['ISO']]['sigReadsig'] 
+                            if 'sigReadsig' in self.noiseparam[data['ISO']] 
+                            else 0.01
+                        }
+                    }
+            
+            noise_map = self.generate_noise_map(
+                image=data["lr"], 
+                iso=data['ISO'],
+                noise_params=noise_params
+            )
+            
+            if noise_map is not None:
+                data["noise_map"] = np.ascontiguousarray(noise_map)
+
         return data
 
 class Mix_Dataset(SID_Dataset):
@@ -427,11 +487,22 @@ class Mix_Dataset(SID_Dataset):
         if data['black_lr']:
             # SNA+黑图
             iso_index = np.argmin(np.abs(self.legalISO-data['ISO']))
-            lr_id = np.random.randint(len(self.blacks[iso_index])) if self.args['mode']=='train' else 0
-            if 'lr10' in self.args['command']:
-                lr_id = np.random.randint(10)
-            lr_raw = rawpy.imread(self.blacks[iso_index][lr_id]).raw_image_visible
-            dgain = 400
+            # 添加防御性检查
+            if len(self.blacks[iso_index]) == 0:
+                # 记录警告信息
+                # log(f'警告: ISO={data["ISO"]}的黑帧列表为空，使用替代方案', log='./logs/empty_blacks.log')
+                # 使用替代方案，例如将black_lr设为False
+                data['black_lr'] = False
+                lr_id = np.random.randint(len(self.infos[idx]['short'])) if self.args['mode']=='train' else 0
+                lr_raw = np.array(dataload(self.infos[idx]['short'][lr_id])).reshape(self.H,self.W)
+                dgain = self.infos[idx]['ratio'][lr_id]
+            else:
+                # 原有逻辑
+                lr_id = np.random.randint(len(self.blacks[iso_index])) if self.args['mode']=='train' else 0
+                if 'lr10' in self.args['command']:
+                    lr_id = np.random.randint(10)
+                lr_raw = rawpy.imread(self.blacks[iso_index][lr_id]).raw_image_visible
+                dgain = 400
         else:
             lr_id = np.random.randint(len(self.infos[idx]['short'])) if self.args['mode']=='train' else 0
             lr_raw = np.array(dataload(self.infos[idx]['short'][lr_id])).reshape(self.H,self.W)
@@ -490,8 +561,31 @@ class Mix_Dataset(SID_Dataset):
 
         data["lr"] = np.ascontiguousarray(lr_crops)
         data["hr"] = np.ascontiguousarray(hr_crops)
-        
+
+        if self.use_noise_map:
+            noise_params = None
+            if self.args["mode"] == 'train' and 'darkshading2' in self.args['command']:
+                if hasattr(self, 'noiseparam') and data['ISO'] in self.noiseparam:
+                    noise_params = {
+                        'shot': self.noiseparam[data['ISO']]['Kmax'],
+                        'read': {
+                            'sigma': self.noiseparam[data['ISO']]['sigReadsig'] 
+                            if 'sigReadsig' in self.noiseparam[data['ISO']] 
+                            else 0.01
+                        }
+                    }
+            
+            noise_map = self.generate_noise_map(
+                image=data["lr"], 
+                iso=data['ISO'],
+                noise_params=noise_params
+            )
+            
+            if noise_map is not None:
+                data["noise_map"] = np.ascontiguousarray(noise_map)
+
         return data
+        
 
 class ELD_Dataset(RealBase_Dataset):
     def __init__(self, args=None):
@@ -533,6 +627,7 @@ class ELD_Dataset(RealBase_Dataset):
                     self.blc_mean[iso] = np.mean(self.blc_mean[iso])
                 else:
                     self.get_darkshading(iso, naive=self.naive)
+
 
     def __len__(self):
         return self.length
@@ -624,6 +719,28 @@ class ELD_Dataset(RealBase_Dataset):
         data["lr"] = np.ascontiguousarray(lr_crops)
         data["hr"] = np.ascontiguousarray(hr_crops)
         
+        if self.use_noise_map:
+            noise_params = None
+            if self.args["mode"] == 'train' and 'darkshading2' in self.args['command']:
+                if hasattr(self, 'noiseparam') and data['ISO'] in self.noiseparam:
+                    noise_params = {
+                        'shot': self.noiseparam[data['ISO']]['Kmax'],
+                        'read': {
+                            'sigma': self.noiseparam[data['ISO']]['sigReadsig'] 
+                            if 'sigReadsig' in self.noiseparam[data['ISO']] 
+                            else 0.01
+                        }
+                    }
+            
+            noise_map = self.generate_noise_map(
+                image=data["lr"], 
+                iso=data['ISO'],
+                noise_params=noise_params
+            )
+            
+            if noise_map is not None:
+                data["noise_map"] = np.ascontiguousarray(noise_map)
+
         return data
 
 class TestDataset(RealBase_Dataset):
@@ -680,6 +797,28 @@ class TestDataset(RealBase_Dataset):
         data['ratio'] = self.args['ratio']
         if self.args['clip']:
             data['data'] = data['data'].clip(0,1)
+
+        if self.use_noise_map:
+            noise_params = None
+            if self.args["mode"] == 'train' and 'darkshading2' in self.args['command']:
+                if hasattr(self, 'noiseparam') and data['ISO'] in self.noiseparam:
+                    noise_params = {
+                        'shot': self.noiseparam[data['ISO']]['Kmax'],
+                        'read': {
+                            'sigma': self.noiseparam[data['ISO']]['sigReadsig'] 
+                            if 'sigReadsig' in self.noiseparam[data['ISO']] 
+                            else 0.01
+                        }
+                    }
+            
+            noise_map = self.generate_noise_map(
+                image=data["lr"], 
+                iso=data['ISO'],
+                noise_params=noise_params
+            )
+            
+            if noise_map is not None:
+                data["noise_map"] = np.ascontiguousarray(noise_map)
 
         return data
 

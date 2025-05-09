@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchsummary
 from .ELD_models import *
+from .dualPathNet_arch import *
 
 def initialize_weights(net):
     for m in net.modules():
