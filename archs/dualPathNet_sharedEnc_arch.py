@@ -111,22 +111,13 @@ class DualPathUNet_E1_Shared(nn.Module):
 
          # 共享编码器
         self.enc1 = SharedEncoder(
-            enc1_in_channels, base_channels,
-            heads=heads[0],
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection
+            enc1_in_channels, base_channels
         )
         self.enc2 = SharedEncoder(
-            base_channels, base_channels*2,
-            heads=heads[1],
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection
+            base_channels, base_channels*2
         )
         self.enc3 = SharedEncoder(
-            base_channels*2, base_channels*4,
-            heads=heads[2],
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection
+            base_channels*2, base_channels*4
         )
 
         # 瓶颈层 - 这里开始两条路径融合

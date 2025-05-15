@@ -8,11 +8,11 @@ sys.path.append('.')
 # 导入验证函数
 from archs.depthwise_separable_conv import (
     verify_replacement, 
-    replace_conv3x3_simple, 
+    replace_conv3x3_with_depthwise, 
     count_parameters,
     get_model_param_summary
 )
-from archs.dualPathNet_sharedEnc_arch import DualPathUNet_E1
+from archs.dualPathNet_sharedEnc_arch import DualPathUNet_E1_Shared
 
 def test_depthwise_conversion():
     """使用完整验证函数测试深度可分离卷积转换"""
@@ -34,7 +34,7 @@ def test_depthwise_conversion():
     try:
         # 1. 创建原始模型
         print("1. 创建原始模型...")
-        original_model = DualPathUNet_E1(args)
+        original_model = DualPathUNet_E1_Shared(args)
         
         # 2. 创建副本用于替换
         print("2. 创建模型副本...")
@@ -42,7 +42,7 @@ def test_depthwise_conversion():
         
         # 3. 替换3x3卷积
         print("3. 替换3x3卷积为深度可分离卷积...")
-        replace_conv3x3_simple(modified_model)
+        replace_conv3x3_with_depthwise(modified_model)
         
         # 4. 使用完整的验证函数
         print("4. 开始完整验证...")

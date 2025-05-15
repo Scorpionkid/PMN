@@ -6,7 +6,7 @@ from utils import *
 from archs import *
 from losses import *
 from base_trainer import *
-from archs.depthwise_separable_conv import DepthwiseSeparableConv, replace_conv3x3_simple, count_parameters
+from archs.depthwise_separable_conv import DepthwiseSeparableConv, replace_conv3x3_with_depthwise, count_parameters
 
 class SID_Trainer(Base_Trainer):
     def __init__(self):
@@ -21,7 +21,7 @@ class SID_Trainer(Base_Trainer):
             print(f"原始参数量: {original_params:,}")
             
             # 替换3x3卷积为深度可分离卷积
-            replace_conv3x3_simple(self.net)
+            replace_conv3x3_with_depthwise(self.net)
             
             # 统计替换后的参数量
             new_params = count_parameters(self.net)
