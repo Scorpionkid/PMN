@@ -65,10 +65,10 @@ class DualPathBlock(nn.Module):
 
         return output, detail, denoise  # 修改：返回融合输出和两条路径的独立输出
 
-class DualPathUNet_E1(nn.Module):
+class DualPathUNet_E1_Shared(nn.Module):
     """double path U-Net, apply double path design on each scale of U-Net"""
     def __init__(self, args=None,  texture_params=None, **kwargs):
-        super(DualPathUNet_E1, self).__init__()
+        super(DualPathUNet_E1_Shared, self).__init__()
 
         base_channels = args['nf']
         in_channels = args['in_channels']
