@@ -12,34 +12,25 @@ from .dual_path_components import (
     EnhancedDetailPath
 )
 
+class SharedEncoder(nn.Module):
+    """共享编码器，输出后分叉成细节和降噪两条路径"""
+    def __init__(self, in_channels, out_channels):
+        super(SharedEncoder, self).__init__()
+        
+        # 共享的特征提取器
+        self.shared_features = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+    
+    def forward(self, x):
+        # 共享特征提取
+        shared_feat = self.shared_features(x)
+        
+        return shared_feat
 
-class IndependentPathEncoder(nn.Module):
-    """编码器模块，独立处理细节或降噪路径，不进行融合"""
-    def __init__(self, in_channels, out_channels, is_detail_path=True,
-                 heads=1, texture_params=None):
-        super(IndependentPathEncoder, self).__init__()
-
-        # 特征提取
-        self.features = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.activation = nn.LeakyReLU(0.2, inplace=True)
-
-        # 根据路径类型选择相应模块
-        self.is_detail_path = is_detail_path
-        if is_detail_path:
-            self.path = EnhancedDetailPath(out_channels, heads)
-        else:
-            self.path = EnhancedDenoisePath(out_channels, heads)
-
-
-    def forward(self, x, noise_map=None, texture_mask=None):
-        # 特征提取
-        feat = self.features(x)
-        feat = self.activation(feat)
-
-        # 路径处理
-        output = self.path(feat, noise_map, texture_mask)
-
-        return output
 
 class DualPathBlock(nn.Module):
     """双路径块，包含细节路径和降噪路径"""
@@ -74,12 +65,10 @@ class DualPathBlock(nn.Module):
 
         return output, detail, denoise  # 修改：返回融合输出和两条路径的独立输出
 
-class DualPathNet_Unetlike(nn.Module):
-    """double path U-Net, apply double path design on each scale of U-Net
-    对齐UNetSeeInDark的5层结构：4层编码器 + 瓶颈 + 4层解码器
-    """
+class DualPathUNet_E1_Shared_UL(nn.Module):
+    """double path U-Net, apply double path design on each scale of U-Net"""
     def __init__(self, args=None,  texture_params=None, **kwargs):
-        super(DualPathNet_Unetlike, self).__init__()
+        super(DualPathUNet_E1_Shared_UL, self).__init__()
 
         base_channels = args['nf']
         in_channels = args['in_channels']
@@ -91,9 +80,6 @@ class DualPathNet_Unetlike(nn.Module):
         self.use_texture_detection = args['use_texture_detection']
         self.enable_intermediate_supervision = args['enable_intermediate_supervision']  # 新增
 
-        # 确保heads有足够的元素，对应5层结构
-        if len(heads) < 5:
-            heads = heads + [heads[-1]] * (5 - len(heads))
 
         # enc1_in_channels = in_channels * 2 if use_noise_map else in_channels
         enc1_in_channels = in_channels
@@ -123,73 +109,34 @@ class DualPathNet_Unetlike(nn.Module):
                 noise_sensitivity=noise_sensitivity
             )
 
-        # 修改：增加到4层编码器，对齐UNetSeeInDark
-        # 细节路径编码器
-        self.enc1_detail = IndependentPathEncoder(
-            enc1_in_channels, base_channels,
-            is_detail_path=True,
-            heads=heads[0],
-            texture_params=self.texture_params
+         # 共享编码器
+        self.enc1 = SharedEncoder(
+            enc1_in_channels, base_channels
         )
-        self.enc2_detail = IndependentPathEncoder(
-            base_channels, base_channels*2,
-            is_detail_path=True,
-            heads=heads[1],
-            texture_params=self.texture_params
+        self.enc2 = SharedEncoder(
+            base_channels, base_channels*2
         )
-        self.enc3_detail = IndependentPathEncoder(
-            base_channels*2, base_channels*4,
-            is_detail_path=True,
-            heads=heads[2],
-            texture_params=self.texture_params
+        self.enc3 = SharedEncoder(
+            base_channels*2, base_channels*4
         )
-        self.enc4_detail = IndependentPathEncoder(
-            base_channels*4, base_channels*8,
-            is_detail_path=True,
-            heads=heads[3],
-            texture_params=self.texture_params
+        self.enc4 = SharedEncoder(
+            base_channels*4, base_channels*8
         )
 
-        # 降噪路径编码器
-        self.enc1_denoise = IndependentPathEncoder(
-            enc1_in_channels, base_channels,
-            is_detail_path=False,
-            heads=heads[0],
-            texture_params=self.texture_params
-        )
-        self.enc2_denoise = IndependentPathEncoder(
-            base_channels, base_channels*2,
-            is_detail_path=False,
-            heads=heads[1],
-            texture_params=self.texture_params
-        )
-        self.enc3_denoise = IndependentPathEncoder(
-            base_channels*2, base_channels*4,
-            is_detail_path=False,
-            heads=heads[2],
-            texture_params=self.texture_params
-        )
-        self.enc4_denoise = IndependentPathEncoder(
-            base_channels*4, base_channels*8,
-            is_detail_path=False,
-            heads=heads[3],
-            texture_params=self.texture_params
-        )
-
-        # 瓶颈层 - 第5层，对应UNetSeeInDark的conv5
+        # 瓶颈层 - 这里开始两条路径融合
         self.bottleneck = DualPathBlock(
             base_channels*8, base_channels*16,
             self.texture_params,
             heads[4]
         )
 
-        # decoder with skip connections - 增加到4层解码器
+        # decoder with skip connections - 保持现有结构
         self.dec4 = DualPathBlock(base_channels*8+base_channels*8, base_channels*8, self.texture_params, heads[3])
         self.dec3 = DualPathBlock(base_channels*4+base_channels*4, base_channels*4, self.texture_params, heads[2])
         self.dec2 = DualPathBlock(base_channels*2+base_channels*2, base_channels*2, self.texture_params, heads[1])
         self.dec1 = DualPathBlock(base_channels+base_channels, base_channels, self.texture_params, heads[0])
 
-        # downsample and upsample - 增加一层上采样
+        # downsample and upsample
         self.down = nn.MaxPool2d(2)
         self.up4 = nn.ConvTranspose2d(base_channels*16, base_channels*8, 2, stride=2)
         self.up3 = nn.ConvTranspose2d(base_channels*8, base_channels*4, 2, stride=2)
@@ -227,7 +174,6 @@ class DualPathNet_Unetlike(nn.Module):
             texture_mask = computed_texture_mask if texture_mask is None else texture_mask
             texture_mask = nmp.standardize_map(texture_mask)
 
-            # 为5层结构创建多尺度纹理图
             texture_maps = nmp.create_multiscale_maps(texture_mask, scales=[1, 2, 4, 6, 8])
             tm_original = texture_maps['scale_1']
             tm_down1 = texture_maps['scale_2']
@@ -241,7 +187,6 @@ class DualPathNet_Unetlike(nn.Module):
         if self.use_noise_map and noise_map is not None:
             noise_map = nmp.standardize_map(noise_map)
 
-            # 为5层结构创建多尺度噪声图
             noise_maps = nmp.create_multiscale_maps(noise_map, scales=[1, 2, 4, 6, 8])
             nm_original = noise_maps['scale_1']
             nm_down1 = noise_maps['scale_2']
@@ -251,68 +196,54 @@ class DualPathNet_Unetlike(nn.Module):
         else:
             nm_original = nm_down1 = nm_down2 = nm_down3 = nm_down4 = None
 
-        #--------------------------- 修改：4层独立编码器路径 ---------------------------#
+        #--------------------------- 修改：独立编码器路径 ---------------------------#
+        # 编码器1
+         #--------------------------- 共享编码器路径 ---------------------------#
+        # 编码器阶段完全共享，只输出共享特征
+        enc1 = self.enc1(x)
+        enc1_down = self.down(enc1)
+        
+        enc2 = self.enc2(enc1_down)
+        enc2_down = self.down(enc2)
+        
+        enc3 = self.enc3(enc2_down)
+        enc3_down = self.down(enc3)
+        enc4 = self.enc4(enc3_down)
+        enc4_down = self.down(enc4)
+        
 
-        # 细节路径编码
-        enc1_detail = self.enc1_detail(x, nm_original, tm_original)
-        enc1_detail_down = self.down(enc1_detail)
-        
-        enc2_detail = self.enc2_detail(enc1_detail_down, nm_down1, tm_down1)
-        enc2_detail_down = self.down(enc2_detail)
-        
-        enc3_detail = self.enc3_detail(enc2_detail_down, nm_down2, tm_down2)
-        enc3_detail_down = self.down(enc3_detail)
-        
-        enc4_detail = self.enc4_detail(enc3_detail_down, nm_down3, tm_down3)
-        enc4_detail_down = self.down(enc4_detail)
-
-        # 降噪路径编码
-        enc1_denoise = self.enc1_denoise(x, nm_original, tm_original)
-        enc1_denoise_down = self.down(enc1_denoise)
-        
-        enc2_denoise = self.enc2_denoise(enc1_denoise_down, nm_down1, tm_down1)
-        enc2_denoise_down = self.down(enc2_denoise)
-        
-        enc3_denoise = self.enc3_denoise(enc2_denoise_down, nm_down2, tm_down2)
-        enc3_denoise_down = self.down(enc3_denoise)
-        
-        enc4_denoise = self.enc4_denoise(enc3_denoise_down, nm_down3, tm_down3)
-        enc4_denoise_down = self.down(enc4_denoise)
-
-        # 瓶颈层 - 合并两条路径，对应conv5
-        # 将两个独立路径的特征连接起来输入到瓶颈层
-        bottleneck_input = (enc4_detail_down + enc4_denoise_down) / 2  # 简单平均或者其他融合策略
+        # 瓶颈层 - 合并两条路径
+        bottleneck_input = enc4_down  
         bottleneck_output, bn_detail, bn_denoise = self.bottleneck(
             bottleneck_input, nm_down4, tm_down4
         )
 
-        #--------------------------- 解码器路径 - 4层解码器 ---------------------------#
+        #--------------------------- 解码器路径 ---------------------------#
+        # 从这里开始使用双路径融合块
 
-        # 解码器4
+        # 解码器3
         bottleneck_up = self.up4(bottleneck_output)
         # 将跳跃连接从两条独立路径连接
-        dec4_input = torch.cat([bottleneck_up, (enc4_detail + enc4_denoise)/2], dim=1)
+        dec4_input = torch.cat([bottleneck_up, enc4], dim=1)
         dec4_output, dec4_detail, dec4_denoise = self.dec4(
             dec4_input, nm_down3, tm_down3
         )
-
-        # 解码器3
         dec4_up = self.up3(dec4_output)
-        dec3_input = torch.cat([dec4_up, (enc3_detail + enc3_denoise)/2], dim=1)
+        dec3_input = torch.cat([dec4_up, enc3], dim=1)
         dec3_output, dec3_detail, dec3_denoise = self.dec3(
             dec3_input, nm_down2, tm_down2
         )
 
         # 解码器2
         dec3_up = self.up2(dec3_output)
-        dec2_input = torch.cat([dec3_up, (enc2_detail + enc2_denoise)/2], dim=1)
+        dec2_input = torch.cat([dec3_up, enc2], dim=1)
         dec2_output, dec2_detail, dec2_denoise = self.dec2(
             dec2_input, nm_down1, tm_down1
         )
 
         # 解码器1
         dec2_up = self.up1(dec2_output)
-        dec1_input = torch.cat([dec2_up, (enc1_detail + enc1_denoise)/2], dim=1)
+        dec1_input = torch.cat([dec2_up, enc1], dim=1)
         dec1_output, dec1_detail, dec1_denoise = self.dec1(
             dec1_input, nm_original, tm_original
         )

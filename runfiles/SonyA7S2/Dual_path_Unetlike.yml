@@ -1,0 +1,89 @@
+mode: 'evaltest'
+checkpoint: 'saved_model/'
+fast_ckpt: 'checkpoints/SonyA7S2'
+model_name: 'SonyA7S2_DualPath_Unet'
+result_dir: 'images/'
+num_gpu: 2
+num_workers: 4
+brightness_correct: True
+
+dst: &base_dst 
+  root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/SID'
+  bias_dir: 'data/SonyA7S2/bias'
+  ds_dir: 'resources/SonyA7S2'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
+  command: 'augv2, idremap, darkshading2++, HB'
+  camera_params_file: 'resources/camera_params/camera_params.yaml'
+  use_noise_map: True
+  noise_map_method: 'iso'  # 'iso' 或 'params'
+  camera_type: 'SonyA7S2'
+  noise_code: 'pgrq'
+  patch_size: 512
+  H: 2848
+  W: 4256
+  crop_per_image: 2
+  croptype: 'non-overlapping'
+  wp: 16383
+  bl: 512
+  ori: False
+  clip: True
+  gpu_preprocess: True
+dst_train:
+  <<: *base_dst
+  mode: 'train'
+  dataset: 'Mix_Dataset' 
+  dstname: 'SID'
+dst_eval:
+  <<: *base_dst
+  root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/ELD/ELD'
+  mode: 'eval'
+  dataset: 'ELD_Dataset' 
+  dstname: 'ELD'
+  iso_list: [800, 1600, 3200]
+  ratio_list: [100, 200]
+dst_test:
+  <<: *base_dst
+  mode: 'evaltest'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
+
+arch:
+  name: 'DualPathNet_Unetlike'
+  in_channels: 4
+  out_channels: 4
+  nf: 32
+  use_dpsv: False
+  res: False
+  cascade: False
+  add: False
+  lock_wb: False
+  heads: [1, 2, 4, 4, 8]
+  dilated_rates: [1, 2, 4, 8]
+  use_wavelet_upsample: true
+  use_sharpness_recovery: true
+  use_noise_map: true
+  use_texture_detection: true
+  enable_intermediate_supervision: True  
+  use_depthwise_separable: true
+
+loss:
+  perceptual: True  
+  gradient: True    
+
+
+
+hyper:
+  lr_scheduler: 'WarmupCosine'
+  learning_rate: 2.e-4
+  batch_size: 2
+  last_epoch: 0
+  step_size: 10
+  stop_epoch : 600
+  T: 3
+  coldstart: False
+  num_workers: 4
+  num_gpus: 2
+  save_freq: 10
+  plot_freq: 100
+  best_psnr: 0.
