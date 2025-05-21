@@ -31,9 +31,6 @@ class IndependentPathEncoder(nn.Module):
         else:
             self.path = EnhancedDenoisePath(out_channels, heads)
 
-        self.use_noise_map = use_noise_map
-        self.use_texture_detection = use_texture_detection
-
     def forward(self, x, noise_map=None, texture_mask=None):
         # 特征提取
         feat = self.features(x)
@@ -126,24 +123,18 @@ class DualPathUNet_E1(nn.Module):
         self.enc1_detail = IndependentPathEncoder(
             enc1_in_channels, base_channels,
             is_detail_path=True,
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection,
             heads=heads[0],
             texture_params=self.texture_params
         )
         self.enc2_detail = IndependentPathEncoder(
             base_channels, base_channels*2,
             is_detail_path=True,
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection,
             heads=heads[1],
             texture_params=self.texture_params
         )
         self.enc3_detail = IndependentPathEncoder(
             base_channels*2, base_channels*4,
             is_detail_path=True,
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection,
             heads=heads[2],
             texture_params=self.texture_params
         )
@@ -152,24 +143,18 @@ class DualPathUNet_E1(nn.Module):
         self.enc1_denoise = IndependentPathEncoder(
             enc1_in_channels, base_channels,
             is_detail_path=False,
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection,
             heads=heads[0],
             texture_params=self.texture_params
         )
         self.enc2_denoise = IndependentPathEncoder(
             base_channels, base_channels*2,
             is_detail_path=False,
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection,
             heads=heads[1],
             texture_params=self.texture_params
         )
         self.enc3_denoise = IndependentPathEncoder(
             base_channels*2, base_channels*4,
             is_detail_path=False,
-            use_noise_map=self.use_noise_map,
-            use_texture_detection=self.use_texture_detection,
             heads=heads[2],
             texture_params=self.texture_params
         )

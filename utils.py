@@ -462,6 +462,179 @@ def plot_sample(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
         plt.close()
     return psnr, ssim, filename
 
+def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet', 
+                epoch=-1, print_metrics=False, save_plot=True, save_path='./', res=None, 
+                detail_output=None, denoise_output=None):
+    """
+    扩展的可视化函数，处理多输出并保存到场景专用目录
+    
+    Args:
+        img_lr: 输入的低光噪声图像
+        img_dn: 主输出的降噪图像
+        img_hr: 目标干净图像
+        detail_output: 细节路径输出 (可选)
+        denoise_output: 降噪路径输出 (可选)
+        filename: 基础文件名
+        model_name: 模型名称
+        epoch: 当前训练轮次
+        print_metrics: 是否打印度量指标
+        save_plot: 是否保存图像
+        save_path: 基础保存路径
+        res: 预计算的指标
+    
+    Returns:
+        psnr: PSNR指标元组 [输入PSNR, 输出PSNR, 细节路径PSNR, 降噪路径PSNR]
+        ssim: SSIM指标元组 [输入SSIM, 输出SSIM, 细节路径SSIM, 降噪路径SSIM]
+        filename: 处理的文件名
+    """
+    if np.max(img_hr) <= 1:
+        # 变回uint8
+        img_lr = scale_up(img_lr)
+        img_dn = scale_up(img_dn)
+        img_hr = scale_up(img_hr)
+        if detail_output is not None:
+            detail_output = scale_up(detail_output)
+        if denoise_output is not None:
+            denoise_output = scale_up(denoise_output)
+    
+    # 计算PSNR和SSIM
+    psnr = []
+    ssim = []
+    
+    if res is None:
+        # 计算输入和主输出的指标
+        psnr.append(compare_psnr(img_hr, img_lr))
+        psnr.append(compare_psnr(img_hr, img_dn))
+        ssim.append(compare_ssim(img_hr, img_lr, channel_axis=-1))
+        ssim.append(compare_ssim(img_hr, img_dn, channel_axis=-1))
+    else:
+        # 使用预计算的输入和主输出指标
+        psnr.append(res[0])  # 输入PSNR
+        psnr.append(res[2])  # 主输出PSNR
+        ssim.append(res[1])  # 输入SSIM
+        ssim.append(res[3])  # 主输出SSIM
+    
+    # 计算细节路径的指标
+    if detail_output is not None:
+        psnr.append(compare_psnr(img_hr, detail_output))
+        ssim.append(compare_ssim(img_hr, detail_output, channel_axis=-1))
+    else:
+        psnr.append(-1)
+        ssim.append(-1)
+    
+    # 计算降噪路径的指标
+    if denoise_output is not None:
+        psnr.append(compare_psnr(img_hr, denoise_output))
+        ssim.append(compare_ssim(img_hr, denoise_output, channel_axis=-1))
+    else:
+        psnr.append(-1)
+        ssim.append(-1)
+                    
+    # 创建场景专用目录
+    scene_dir = os.path.join(save_path, f"scene_{filename}_Epoch{epoch}")
+    
+    if save_plot:
+        # 确保目录存在
+        os.makedirs(scene_dir, exist_ok=True)
+        
+        # 保存各个图像（不使用matplotlib绘图）
+        input_rgb = img_lr
+        main_rgb = img_dn
+        target_rgb = img_hr
+        
+        # 使用OpenCV保存单独的图像
+        cv2.imwrite(os.path.join(scene_dir, "01_input.png"), input_rgb[:,:,::-1])
+        cv2.imwrite(os.path.join(scene_dir, "04_main_output.png"), main_rgb[:,:,::-1])
+        cv2.imwrite(os.path.join(scene_dir, "05_ground_truth.png"), target_rgb[:,:,::-1])
+        
+        if detail_output is not None:
+            cv2.imwrite(os.path.join(scene_dir, "02_detail_path.png"), detail_output[:,:,::-1])
+        
+        if denoise_output is not None:
+            cv2.imwrite(os.path.join(scene_dir, "03_denoise_path.png"), denoise_output[:,:,::-1])
+        
+        # 保存对比图，但方式更安全
+        try:
+            # 线程安全的方式创建新图形
+            with plt.rc_context():  # 使用独立的RC上下文
+                plt.figure(figsize=(25, 6))
+                
+                # 只创建需要的轴（基于可用数据）
+                num_plots = 3  # 输入、主输出、GT是必须的
+                if detail_output is not None:
+                    num_plots += 1
+                if denoise_output is not None:
+                    num_plots += 1
+                
+                current_pos = 1
+                plt.subplot(1, num_plots, current_pos)
+                plt.imshow(img_lr)
+                plt.title(f"Input\nPSNR: {psnr[0]:.2f} - SSIM: {ssim[0]:.4f}")
+                plt.axis('off')
+                current_pos += 1
+                
+                if detail_output is not None:
+                    plt.subplot(1, num_plots, current_pos)
+                    plt.imshow(detail_output)
+                    plt.title(f"Detail Path\nPSNR: {psnr[2]:.2f} - SSIM: {ssim[2]:.4f}")
+                    plt.axis('off')
+                    current_pos += 1
+                
+                if denoise_output is not None:
+                    plt.subplot(1, num_plots, current_pos)
+                    plt.imshow(denoise_output)
+                    plt.title(f"Denoise Path\nPSNR: {psnr[3]:.2f} - SSIM: {ssim[3]:.4f}")
+                    plt.axis('off')
+                    current_pos += 1
+                
+                plt.subplot(1, num_plots, current_pos)
+                plt.imshow(img_dn)
+                plt.title(f"{model_name}\nPSNR: {psnr[1]:.2f} - SSIM: {ssim[1]:.4f}")
+                plt.axis('off')
+                current_pos += 1
+                
+                plt.subplot(1, num_plots, current_pos)
+                plt.imshow(img_hr)
+                plt.title("Ground Truth")
+                plt.axis('off')
+                
+                plt.suptitle(f'{filename} - Epoch: {epoch}')
+                plt.savefig(os.path.join(scene_dir, "comparison.jpg"), bbox_inches='tight')
+                plt.close()  # 确保关闭图形
+        except Exception as e:
+            print(f"警告：保存比较图出错，但继续处理：{str(e)}")
+        
+        # 差异图处理（改为更简单的实现，避免matplotlib问题）
+        # if detail_output is not None and denoise_output is not None:
+        #     try:
+        #         # 计算差异图
+        #         detail_diff = np.abs(detail_output.astype(np.float32) - img_dn.astype(np.float32))
+        #         detail_diff = np.clip(detail_diff * 5, 0, 255).astype(np.uint8)
+                
+        #         denoise_diff = np.abs(denoise_output.astype(np.float32) - img_dn.astype(np.float32))
+        #         denoise_diff = np.clip(denoise_diff * 5, 0, 255).astype(np.uint8)
+                
+        #         path_diff = np.abs(detail_output.astype(np.float32) - denoise_output.astype(np.float32))
+        #         path_diff = np.clip(path_diff * 5, 0, 255).astype(np.uint8)
+                
+        #         # 直接保存差异图，不使用热图
+        #         cv2.imwrite(os.path.join(scene_dir, "diff_detail_main.png"), detail_diff[:,:,::-1])
+        #         cv2.imwrite(os.path.join(scene_dir, "diff_denoise_main.png"), denoise_diff[:,:,::-1])
+        #         cv2.imwrite(os.path.join(scene_dir, "diff_detail_denoise.png"), path_diff[:,:,::-1])
+                
+        #         # 转为灰度热图（使用OpenCV的归一化和着色而不是matplotlib）
+        #         detail_heat = cv2.applyColorMap(cv2.cvtColor(detail_diff, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_HOT)
+        #         denoise_heat = cv2.applyColorMap(cv2.cvtColor(denoise_diff, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_HOT)
+        #         path_heat = cv2.applyColorMap(cv2.cvtColor(path_diff, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_HOT)
+                
+        #         cv2.imwrite(os.path.join(scene_dir, "heat_detail_main.png"), detail_heat)
+        #         cv2.imwrite(os.path.join(scene_dir, "heat_denoise_main.png"), denoise_heat)
+        #         cv2.imwrite(os.path.join(scene_dir, "heat_detail_denoise.png"), path_heat)
+        #     except Exception as e:
+        #         print(f"警告：生成差异图出错，但继续处理：{str(e)}")
+
+    return psnr, ssim, filename
+
 def save_picture(img_sr, save_path='./images/test',frame_id='0000'):
     # 变回uint8
     img_sr = scale_up(img_sr.transpose(1,2,0))

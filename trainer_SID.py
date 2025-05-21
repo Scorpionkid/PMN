@@ -14,22 +14,22 @@ class SID_Trainer(Base_Trainer):
         # model
         self.net = globals()[self.arch['name']](self.arch)
         
-         # ===== 检查配置中是否启用深度可分离卷积 =====
+        # ===== 检查配置中是否启用深度可分离卷积 =====
         if self.arch.get('use_depthwise_separable', False):
-            print("启用深度可分离卷积...")
+            # print("启用深度可分离卷积...")
             original_params = count_parameters(self.net)
             print(f"原始参数量: {original_params:,}")
             
-            # 替换3x3卷积为深度可分离卷积
-            replace_conv3x3_with_depthwise(self.net)
+            # # 替换3x3卷积为深度可分离卷积
+            # replace_conv3x3_with_depthwise(self.net)
             
-            # 统计替换后的参数量
-            new_params = count_parameters(self.net)
-            reduction = (original_params - new_params) / original_params * 100
-            print(f"替换后参数量: {new_params:,}")
-            print(f"参数减少: {reduction:.1f}%")
+            # # 统计替换后的参数量
+            # new_params = count_parameters(self.net)
+            # reduction = (original_params - new_params) / original_params * 100
+            # print(f"替换后参数量: {new_params:,}")
+            # print(f"参数减少: {reduction:.1f}%")
         # ===== 结束 =====
-        
+
         # Raw2RGB
         if 'isp' in self.dst['command'].lower():
             self.arch_isp = self.args['arch_isp']
@@ -39,22 +39,23 @@ class SID_Trainer(Base_Trainer):
             self.isp = load_weights(self.isp, model_dict, by_name=False)
             self.isp = self.isp.to(self.device)
             log('Use the ISP_CNN.pth from RViDeNet as ISP...')
-        # load weight
-        if self.hyper['last_epoch']:    # 不是初始化
-            try:
-                model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
-                if not os.path.exists(model_path):
-                    model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
-                model = torch.load(model_path, map_location=self.device)
-                self.net = load_weights(self.net, model, by_name=True)
-            except:
-                log('No checkpoint file!!!')
+
+        self.current_epoch = self.hyper['last_epoch']
+
+        if torch.cuda.device_count() > 1:
+            log("Using PyTorch's nn.DataParallel for multi-gpu...")
+            self.multi_gpu = True
+            self.net = nn.DataParallel(self.net)
         else:
-            log(f'Initializing {self.arch["name"]}...')
-            # initialize_weights(self.net)
+            self.multi_gpu = False
 
         self.optimizer = Adam(self.net.parameters(), lr=self.hyper['learning_rate'])
-        
+
+        # Choose Learning Rate
+        self.lr_lambda = self.get_lr_lambda_func()
+        self.scheduler = LambdaScheduler(self.optimizer, self.lr_lambda)
+
+
         self.infos = None
         if self.mode=='train':
             self.dst_train = globals()[self.args['dst_train']['dataset']](self.args['dst_train'])
@@ -64,9 +65,6 @@ class SID_Trainer(Base_Trainer):
             self.dataloader_eval = DataLoader(self.dst_eval, batch_size=1, shuffle=False, 
                                     num_workers=self.args['num_workers'], pin_memory=False)
 
-        # Choose Learning Rate
-        self.lr_lambda = self.get_lr_lambda_func()
-        self.scheduler = LambdaScheduler(self.optimizer, self.lr_lambda)
 
         self.net = self.net.to(self.device)
         self.loss = Unet_Loss()
@@ -89,6 +87,36 @@ class SID_Trainer(Base_Trainer):
         self.eval_ssim_lr = AverageMeter('SSIM', ':4f')
         self.eval_psnr_dn = AverageMeter('PSNR', ':2f')
         self.eval_ssim_dn = AverageMeter('SSIM', ':4f')
+
+        # load weight
+        if self.hyper['last_epoch']:    # 不是初始化
+            try:
+                # 优先尝试加载断点
+                model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
+                if not os.path.exists(model_path):
+                    model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
+                    
+                checkpoint = torch.load(model_path, map_location=self.device)
+                
+                # 检查是否是完整的训练状态(新格式)还是仅模型权重(旧格式)
+                if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
+                    # 加载完整训练状态
+                    self.load_checkpoint(checkpoint)
+                    log(f"从epoch {checkpoint['epoch']} 恢复训练状态")
+                    # 如果加载的checkpoint与last_epoch不匹配，更新current_epoch
+                    if checkpoint['epoch'] != self.hyper['last_epoch']:
+                        log(f"注意: YML中的last_epoch为{self.hyper['last_epoch']}，已更新为checkpoint中的{checkpoint['epoch']}")
+                        self.current_epoch = checkpoint['epoch']
+                else:
+                    # 仅加载模型权重(向后兼容)
+                    self.net = load_weights(self.net, checkpoint, multi_gpu=self.multi_gpu, by_name=True)
+                    log(f"已加载模型权重(仅参数), epoch={self.hyper['last_epoch']}")
+            except Exception as e:
+                log(f'无法加载checkpoint: {e}')
+        else:
+            log(f'Initializing {self.arch["name"]}...')
+            # initialize_weights(self.net)
+
         self.logfile = f'./logs/log_{self.model_name}.log'
         log(f'Model Name:\t{self.model_name}', log=self.logfile, notime=True)
         log(f'Architecture:\t{self.arch["name"]}', log=self.logfile, notime=True)
@@ -111,13 +139,10 @@ class SID_Trainer(Base_Trainer):
             log(f"Using Numpy's CPU Preprocess")
             self.use_gpu = False 
 
-        if torch.cuda.device_count() > 1:
-            log("Using PyTorch's nn.DataParallel for multi-gpu...")
-            self.multi_gpu = True
-            self.net = nn.DataParallel(self.net)
-        else:
-            self.multi_gpu = False
         self.ratiofix = True if 'ratiofix' in self.dst['command'] else False
+        
+        # 设置信号处理
+        # self.setup_signal_handler()
     
     def change_eval_dst(self, mode='eval'):
         self.dst = self.args[f'dst_{mode}']
@@ -127,10 +152,26 @@ class SID_Trainer(Base_Trainer):
                                     num_workers=self.args['num_workers'], pin_memory=False)
         self.cache_dir = f'/data/cache/{self.dstname}'
 
+    # 添加信号处理方法
+    def setup_signal_handler(self):
+        """设置信号处理函数，捕获中断信号并保存训练状态"""
+        import sys
+        def signal_handler(sig, frame):
+            print('\n接收到中断信号，保存训练状态...')
+            self.save_checkpoint(self.current_epoch, f'{self.fast_ckpt}/{self.model_name}_interrupt.pth')
+            print('训练状态已保存，程序退出')
+            sys.exit(0)
+        
+        import signal
+        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler) # kill命令
+
     def train(self):
         self.scheduler.step()
         lr = self.scheduler.get_last_lr()[0]
-        for epoch in range(self.hyper['last_epoch']+1, self.hyper['stop_epoch']+1):
+        start_epoch = self.current_epoch + 1
+        for epoch in range(start_epoch, self.hyper['stop_epoch']+1):
+            self.current_epoch = epoch
             # log init
             self.net.train()
             self.train_psnr.reset()
@@ -167,7 +208,7 @@ class SID_Trainer(Base_Trainer):
                         pred = main_output
                                 
                         # 计算多损失
-                        loss = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
+                        loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
                     else:
                         pred = self.net(imgs_lr)
                         # 极暗，乘上去
@@ -191,14 +232,18 @@ class SID_Trainer(Base_Trainer):
                         imgs_hr = torch.clamp(imgs_hr, 0, 1)
                         psnr = PSNR_Loss(pred, imgs_hr)
                         self.train_psnr.update(psnr.item())
+
+                    # 格式化损失值用于显示
+                    loss_str = ' '.join([f"{k}:{v:.4f}" for k, v in loss_values.items()])
                     
                     runtime['total'] = runtime['preprocess']+runtime['dataloader']+runtime['net']+runtime['bp']
                     t.set_description(f'Epoch {epoch}')
                     t.set_postfix({'lr':f"{lr:.2e}", 'PSNR':f"{self.train_psnr.avg:.2f}",
-                                    'loader':f"{100*runtime['dataloader']/runtime['total']:.1f}%",
-                                    'process':f"{100*runtime['preprocess']/runtime['total']:.1f}%",
-                                    'net':f"{100*runtime['net']/runtime['total']:.1f}%",
-                                    'bp':f"{100*runtime['bp']/runtime['total']:.1f}%",})
+                                    # 'loader':f"{100*runtime['dataloader']/runtime['total']:.1f}%",
+                                    # 'process':f"{100*runtime['preprocess']/runtime['total']:.1f}%",
+                                    # 'net':f"{100*runtime['net']/runtime['total']:.1f}%",
+                                    # 'bp':f"{100*runtime['bp']/runtime['total']:.1f}%",
+                                    'loss': loss_str})
                     t.update(1)
                     time_points[0] = time.time()
 
@@ -208,10 +253,11 @@ class SID_Trainer(Base_Trainer):
 
             # 存储模型
             if epoch % self.hyper['save_freq'] == 0:
-                model_dict = self.net.module.state_dict() if self.multi_gpu else self.net.state_dict()
+                # model_dict = self.net.module.state_dict() if self.multi_gpu else self.net.state_dict()
                 epoch_id = epoch // self.hyper['plot_freq'] * self.hyper['plot_freq']
                 save_path = os.path.join(self.model_dir, '%s_e%04d.pth'% (self.model_name, epoch_id))
-                torch.save(model_dict, save_path)
+                self.save_checkpoint(epoch_id, save_path)
+                # torch.save(model_dict, save_path)
             
             # 输出过程量，随时看
             savefile = os.path.join(self.sample_dir, f'{self.model_name}_train_psnr.jpg')
@@ -241,8 +287,9 @@ class SID_Trainer(Base_Trainer):
                 self.dst_eval.fast_eval(on=True)
                 self.eval(epoch=epoch)
                 self.dst_eval.fast_eval(on=False)
-                model_dict = self.net.module.state_dict() if self.multi_gpu else self.net.state_dict()
-                torch.save(model_dict, f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
+                # model_dict = self.net.module.state_dict() if self.multi_gpu else self.net.state_dict()
+                # torch.save(model_dict, f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
+                self.save_checkpoint(epoch, f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
             
             # reload best model each period
             num_of_epochs = self.hyper['stop_epoch'] - self.hyper['last_epoch']
@@ -252,7 +299,7 @@ class SID_Trainer(Base_Trainer):
                 model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
                 if os.path.exists(model_path):
                     model = torch.load(model_path, map_location=self.device)
-                    self.net = load_weights(self.net, model, by_name=True)
+                    self.net = load_weights(self.net, model, self.multi_gpu, by_name=True)
                     log(f'Successfully reload best model (Eval PSNR:{self.best_psnr})',
                         log=f'./logs/log_{self.model_name}.log')
 
@@ -362,7 +409,7 @@ class SID_Trainer(Base_Trainer):
                             # self.multiprocess_plot(imgs_lr, imgs_dn, imgs_hr, 
                             #         wb, ccm, name, save_plot, epoch, raw_metrics, k)
                             pool.append(threading.Thread(target=self.multiprocess_plot, args=(imgs_lr, imgs_dn, imgs_hr, 
-                                    wb, ccm, name, save_plot, epoch, raw_metrics, k)))
+                                    wb, ccm, name, save_plot, epoch, raw_metrics, k, denoise_output, detail_output)))
                             pool[k].start()
                         else:
                             infos = self.infos[k] if self.infos is not None else None
@@ -373,16 +420,29 @@ class SID_Trainer(Base_Trainer):
                             else:
                                 inputs = np.load(infos['path_npy_in'])
                                 target = np.load(infos['path_npy_gt'])
+
                             if 'isp' not in self.dst['command'].lower():
                                 output = raw2rgb_rawpy(imgs_dn, wb=wb, ccm=ccm)
-                            # raw_metrics = None # 用RGB metrics
+                                detail_rgb = raw2rgb_rawpy(detail_output, wb=wb, ccm=ccm) if detail_output is not None else None
+                                denoise_rgb = raw2rgb_rawpy(denoise_output, wb=wb, ccm=ccm) if denoise_output is not None else None
+                            raw_metrics = None # 用RGB metrics
+
+                            # task_list.append(
+                            #     pool.submit(plot_dual_path_sample, inputs, output, target, 
+                            #         detail_rgb, denoise_rgb,
+                            #         filename=name, save_plot=save_plot, epoch=epoch,
+                            #         model_name=self.model_name, save_path=self.sample_dir,
+                            #         res=raw_metrics
+                            #         )
+                            #     )
+                            
                             task_list.append(
-                                pool.submit(plot_sample, inputs, output, target, 
+                                pool.submit(plot_sample_V2, inputs, output, target, 
                                     filename=name, save_plot=save_plot, epoch=epoch,
                                     model_name=self.model_name, save_path=self.sample_dir,
-                                    res=raw_metrics
-                                    )
+                                    res=raw_metrics, detail_output=detail_rgb, denoise_output=denoise_rgb
                                 )
+                            )
 
                     t.set_description(f'{name}')
                     t.set_postfix({'PSNR':f"{self.eval_psnr.avg:.2f}"})
@@ -410,8 +470,9 @@ class SID_Trainer(Base_Trainer):
         if self.eval_psnr_dn.avg >= self.best_psnr and epoch > 0:
             self.best_psnr = self.eval_psnr_dn.avg
             log(f"Best PSNR is {self.best_psnr} now!!")
-            model_dict = self.net.module.state_dict() if self.multi_gpu else self.net.state_dict()
-            torch.save(model_dict, f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
+            # model_dict = self.net.module.state_dict() if self.multi_gpu else self.net.state_dict()
+            # torch.save(model_dict, f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
+            self.save_checkpoint(epoch, f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
 
         log(f"Epoch {epoch}: PSNR={self.eval_psnr.avg:.2f}\n"
             +f"psnrs_lr={self.eval_psnr_lr.avg:.2f}, psnrs_dn={self.eval_psnr_dn.avg:.2f}"
@@ -429,7 +490,7 @@ class SID_Trainer(Base_Trainer):
         gc.collect()
         return metrics
     
-    def multiprocess_plot(self, imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch, raw_metrics, k):
+    def multiprocess_plot(self, imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch, raw_metrics, k, denoise_output=None, detail_output=None):
         # if self.infos is None:
         inputs = raw2rgb_rawpy(imgs_lr, wb=wb, ccm=ccm)
         target = raw2rgb_rawpy(imgs_hr, wb=wb, ccm=ccm)
@@ -437,13 +498,25 @@ class SID_Trainer(Base_Trainer):
         #     inputs = np.load(self.infos[k]['path_npy_in'])
         #     target = np.load(self.infos[k]['path_npy_gt'])
         output = raw2rgb_rawpy(imgs_dn, wb=wb, ccm=ccm)
+        denoise_rgb = raw2rgb_rawpy(denoise_output, wb=wb, ccm=ccm) if denoise_output is not None else None
+        detail_rgb = raw2rgb_rawpy(detail_output, wb=wb, ccm=ccm) if detail_output is not None else None
         
-        psnr, ssim, _ = plot_sample(inputs, output, target, 
-                        filename=name, 
-                        save_plot=save_plot, epoch=epoch,
-                        model_name=self.model_name,
-                        save_path=self.sample_dir,
-                        res=raw_metrics)
+        # psnr, ssim, _ = plot_sample(inputs, output, target, 
+        #                 filename=name, 
+        #                 save_plot=save_plot, epoch=epoch,
+        #                 model_name=self.model_name,
+        #                 save_path=self.sample_dir,
+        #                 res=raw_metrics)
+
+        psnr, ssim, _ = plot_sample_V2(inputs, output, target, 
+                    filename=name, 
+                    save_plot=save_plot, epoch=epoch,
+                    model_name=self.model_name,
+                    save_path=self.sample_dir,
+                    res=raw_metrics,
+                    detail_output=detail_rgb,
+                    denoise_output=denoise_rgb)
+        
         self.eval_psnr_lr.update(psnr[0])
         self.eval_psnr_dn.update(psnr[1])
         self.eval_ssim_lr.update(ssim[0])
@@ -534,7 +607,7 @@ class SID_Trainer(Base_Trainer):
         total_loss = 0
         
         # 主输出损失 - 使用普通的L1损失
-        main_loss = self.loss(main_output.clamp(0,1), gt)
+        main_loss = self.loss(main_output, gt)
         total_loss += main_loss
         
         # 记录详细损失值用于日志（可选）
@@ -544,23 +617,95 @@ class SID_Trainer(Base_Trainer):
         if detail_output is not None:
             # 可以添加VGG感知损失，需要先初始化
             if hasattr(self, 'perceptual_loss'):
-                detail_percep_loss = self.perceptual_loss(detail_output.clamp(0,1), gt)
+                detail_percep_loss = self.perceptual_loss(detail_output, gt)
                 total_loss += detail_percep_loss * 0.1  # 权重可调
                 loss_values['detail_percep_loss'] = detail_percep_loss.item()
                 
             # 添加梯度损失
             if hasattr(self, 'gradient_loss'):
-                detail_grad_loss = self.gradient_loss(detail_output.clamp(0,1), gt)
+                detail_grad_loss = self.gradient_loss(detail_output, gt)
                 total_loss += detail_grad_loss * 0.5  # 权重可调
                 loss_values['detail_grad_loss'] = detail_grad_loss.item()
         
         # 降噪路径中间监督 - 使用L1损失
         if denoise_output is not None:
-            denoise_loss = self.loss(denoise_output.clamp(0,1), gt)
+            denoise_loss = self.loss(denoise_output, gt)
             total_loss += denoise_loss * 0.5  # 权重可调
             loss_values['denoise_loss'] = denoise_loss.item()
         
-        return total_loss
+        return total_loss, loss_values
+    
+    def save_checkpoint(self, epoch, filepath, is_best=False):
+        """保存完整的训练状态"""
+        checkpoint = {
+            'epoch': epoch,
+            'model': self.net.module.state_dict() if self.multi_gpu else self.net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'best_psnr': self.best_psnr,
+            'train_psnr': {
+                'avg': self.train_psnr.avg,
+                'history': self.train_psnr.history
+            },
+            'eval_psnr': {
+                'avg': self.eval_psnr.avg,
+                'history': self.eval_psnr.history
+            },
+            'eval_ssim': {
+                'avg': self.eval_ssim.avg if hasattr(self.eval_ssim, 'avg') else 0,
+                'history': self.eval_ssim.history if hasattr(self.eval_ssim, 'history') else []
+            }
+            # ,
+            # 'random_state': {
+            #     'numpy': np.random.get_state(),
+            #     'pytorch': torch.get_rng_state(),
+            #     'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            # }
+        }
+        
+        torch.save(checkpoint, filepath)
+        if is_best:
+            log(f"保存最佳模型: {filepath} (PSNR: {self.best_psnr:.2f})")
+        else:
+            log(f"保存训练状态: {filepath}")
+
+    def load_checkpoint(self, checkpoint):
+        """加载训练状态断点"""
+        # 加载模型权重
+        if self.multi_gpu:
+            self.net.module.load_state_dict(checkpoint['model'])
+        else:
+            self.net.load_state_dict(checkpoint['model'])
+        
+        # 加载优化器状态
+        if 'optimizer' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        
+        # 加载学习率调度器
+        if 'scheduler' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # 加载训练指标
+        if 'best_psnr' in checkpoint:
+            self.best_psnr = checkpoint['best_psnr']
+        
+        # 加载PSNR历史
+        if 'train_psnr' in checkpoint and isinstance(checkpoint['train_psnr'], dict):
+            if 'history' in checkpoint['train_psnr']:
+                self.train_psnr.history = checkpoint['train_psnr']['history']
+        
+        if 'eval_psnr' in checkpoint and isinstance(checkpoint['eval_psnr'], dict):
+            if 'history' in checkpoint['eval_psnr']:
+                self.eval_psnr.history = checkpoint['eval_psnr']['history']
+        
+        # 加载随机状态
+        # if 'random_state' in checkpoint:
+        #     if 'numpy' in checkpoint['random_state']:
+        #         np.random.set_state(checkpoint['random_state']['numpy'])
+        #     if 'pytorch' in checkpoint['random_state']:
+        #         torch.set_rng_state(checkpoint['random_state']['pytorch'])
+        #     if 'cuda' in checkpoint['random_state'] and checkpoint['random_state']['cuda'] is not None:
+        #         torch.cuda.set_rng_state_all(checkpoint['random_state']['cuda'])
 
 def MultiProcessPlot(imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch, 
                     raw_metrics, infos, model_name, sample_dir):
