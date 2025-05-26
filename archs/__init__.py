@@ -7,6 +7,8 @@ import torchsummary
 from .ELD_models import *
 from .dualPathNet_arch import *
 from .dualPathNet_sharedEnc_arch import *
+from .pbnet_model import *
+
 
 def initialize_weights(net):
     for m in net.modules():

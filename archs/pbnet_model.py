@@ -1,440 +1,451 @@
 """
 PBNet: Physics-Based Network for Raw Image Denoising
-Author: [hgh]
-Date: 2025
-Description: A lightweight physics-constrained network for raw image denoising
-             that incorporates Bayer-aware processing and ISO-adaptive learning
+基于PMN框架的物理约束网络实现
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from collections import OrderedDict
+from .modules import *
+from typing import Optional, Dict, Any
+
+# 从PMN框架导入噪声处理函数
+try:
+    from data_process.process import get_camera_noisy_params_max, sample_params_max
+    from data_process.noise_map import generate_noise_map
+except:
+    print("Warning: PMN noise processing modules not found")
 
 
-class DepthwiseSeparableConv(nn.Module):
-    """深度可分离卷积，用于减少参数量"""
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, bias=False):
-        super().__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, 
-                                   padding=padding, groups=in_channels, bias=bias)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
-        
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        return x
-
-
-class LightweightBayerPreprocess(nn.Module):
-    """轻量级Bayer预处理模块"""
-    def __init__(self):
-        super().__init__()
-        # Bayer pattern masks for RGGB
-        self.register_buffer('r_mask', torch.tensor([[1,0],[0,0]], dtype=torch.float32))
-        self.register_buffer('g_mask', torch.tensor([[0,1],[0,1]], dtype=torch.float32))
-        self.register_buffer('b_mask', torch.tensor([[0,0],[1,0]], dtype=torch.float32))
-    
-    def forward(self, x):
-        """
-        输入: [B, C, H, W] - 原始Bayer图像
-        输出: [B, C*4, H//2, W//2] - 展开的RGGB通道
-        """
-        B, C, H, W = x.shape
-        # 展开2x2块
-        x_unfold = F.unfold(x, kernel_size=2, stride=2)  # [B, C*4, H*W/4]
-        x_unfold = x_unfold.view(B, C, 4, H//2, W//2)   # [B, C, 4, H//2, W//2]
-        
-        # 提取RGGB通道
-        r = x_unfold[:, :, 0:1, :, :]  # R
-        g1 = x_unfold[:, :, 1:2, :, :] # G1
-        b = x_unfold[:, :, 2:3, :, :] # G2
-        g2 = x_unfold[:, :, 3:4, :, :]  # B
-        
-        # 合并绿色通道
-        g = (g1 + g2) / 2
-        
-        # 拼接为 [B, C*4, H//2, W//2]
-        out = torch.cat([r, g1, b, g2], dim=2)
-        out = out.view(B, C*4, H//2, W//2)
-        return out
-
-
-class PhysicsConstraintModule(nn.Module):
-    """物理约束模块"""
-    def __init__(self, channels, iso_levels=10):
+class PhysicsConstraintBlock(nn.Module):
+    """物理约束块 - 使用PMN的噪声参数"""
+    def __init__(self, channels, reduction=4):
         super().__init__()
         self.channels = channels
-        self.iso_levels = iso_levels
         
-        # ISO自适应参数
-        self.iso_embed = nn.Embedding(iso_levels, channels//8)
-        self.iso_proj = nn.Sequential(
-            nn.Conv2d(channels//8, channels//4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels//4, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        # 噪声级别预测
-        self.noise_predictor = nn.Sequential(
+        # 噪声参数调制网络
+        self.noise_modulator = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels//16, 1),
+            nn.Conv2d(channels + 1, channels // reduction, 1),  # +1 for noise map
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels//16, 1, 1),
+            nn.Conv2d(channels // reduction, channels, 1),
             nn.Sigmoid()
         )
         
-        # 物理约束的残差生成
-        self.residual_gen = nn.Sequential(
-            DepthwiseSeparableConv(channels, channels//2),
-            nn.ReLU(inplace=True),
-            DepthwiseSeparableConv(channels//2, channels)
+        # 残差生成
+        self.residual_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),  # 深度卷积
+            nn.Conv2d(channels, channels, 1),  # 逐点卷积
+            nn.Tanh()
         )
         
-        # 系统增益参数（可学习）
-        self.register_buffer('system_gain', torch.linspace(0.1, 2.0, iso_levels))
-        
-    def forward(self, x, iso_idx=None):
+    def forward(self, x, noise_map=None):
         """
-        x: 输入特征 [B, C, H, W]
-        iso_idx: ISO索引 [B]
+        x: 特征图 [B, C, H, W]
+        noise_map: 噪声图 [B, 1, H, W] (从PMN的generate_noise_map获得)
         """
-        if iso_idx is None:
+        if noise_map is None:
             return x
         
-        B, C, H, W = x.shape
+        # 调整噪声图大小以匹配特征图
+        if noise_map.shape[-2:] != x.shape[-2:]:
+            noise_map = F.interpolate(noise_map, size=x.shape[-2:], mode='bilinear', align_corners=False)
         
-        # ISO自适应调制
-        iso_feat = self.iso_embed(iso_idx)  # [B, C//8]
-        iso_feat = iso_feat.view(B, -1, 1, 1)
-        iso_weight = self.iso_proj(iso_feat)  # [B, C, 1, 1]
+        # 拼接特征和噪声图
+        combined = torch.cat([x, noise_map], dim=1)
         
-        # 噪声级别估计
-        noise_level = self.noise_predictor(x)  # [B, 1, 1, 1]
-        
-        # 获取当前ISO的系统增益
-        gain = self.system_gain[iso_idx].view(B, 1, 1, 1)
+        # 生成调制权重
+        weight = self.noise_modulator(combined)
         
         # 生成物理约束的残差
-        residual = self.residual_gen(x * iso_weight)
+        residual = self.residual_conv(x * weight)
         
-        # 应用物理约束：残差应与噪声级别和系统增益相关
-        physics_residual = residual * noise_level * torch.sqrt(gain)
+        # 使用噪声图调制残差强度
+        noise_strength = torch.sqrt(noise_map.clamp(min=1e-6))
+        residual = residual * noise_strength
         
-        return x + 0.1 * physics_residual  # 小幅度残差修正
+        return x + residual * 0.1  # 小幅残差
 
 
-class ConvBlock(nn.Module):
-    """基础卷积块"""
-    def __init__(self, in_channels, out_channels, use_depthwise=False):
+class BayerConvBlock(nn.Module):
+    """Bayer-aware卷积块 - 针对RGGB模式"""
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        if use_depthwise and in_channels == out_channels:
-            self.conv1 = DepthwiseSeparableConv(in_channels, out_channels)
-        else:
-            self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        
+        # RGGB通道分组处理
+        assert in_channels % 4 == 0 and out_channels % 4 == 0
+        group_in = in_channels // 4
+        group_out = out_channels // 4
+        
+        # 对每个Bayer通道独立处理
+        self.conv_r = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
+        self.conv_g1 = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
+        self.conv_g2 = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
+        self.conv_b = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
+        
+        # 跨通道融合
+        self.fusion = nn.Conv2d(out_channels, out_channels, 1)
+        self.norm = nn.InstanceNorm2d(out_channels)
         self.relu = nn.LeakyReLU(0.2, inplace=True)
         
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        return x
+        # 分离RGGB通道
+        B, C, H, W = x.shape
+        x_reshape = x.view(B, 4, C//4, H, W)
+        
+        # 独立处理每个通道
+        r = self.conv_r(x_reshape[:, 0])
+        g1 = self.conv_g1(x_reshape[:, 1])
+        g2 = self.conv_g2(x_reshape[:, 2])
+        b = self.conv_b(x_reshape[:, 3])
+        
+        # 合并
+        out = torch.cat([r, g1, g2, b], dim=1)
+        
+        # 跨通道融合
+        out = self.fusion(out)
+        out = self.norm(out)
+        out = self.relu(out)
+        
+        return out
 
 
 class PBNet(nn.Module):
-    """
-    Physics-Based Network for Raw Image Denoising
-    结合物理约束和Bayer-aware处理的轻量级去噪网络
-    """
+    """Physics-Based Network - 基于PMN框架的物理约束网络"""
     def __init__(self, args=None):
         super().__init__()
         
         # 默认参数
-        if args is None:
-            args = {
-                'nframes': 1,
-                'in_nc': 4,      # Bayer RGGB
-                'out_nc': 3,     # RGB输出
-                'nf': 32,        # 基础通道数
-                'res': True,     # 是否使用残差连接
-                'iso_levels': 10,
-                'use_physics': True,
-                'use_bayer_preprocess': True
-            }
+        self.args = args or {
+            'nframes': 1,
+            'in_nc': 4,      # RGGB
+            'out_nc': 4,     # 保持RGGB输出
+            'nf': 32,
+            'res': True,
+            'use_physics': True,
+            'use_bayer_conv': True,
+            'camera_type': 'SonyA7S2'
+        }
         
-        self.args = args
-        nframes = args['nframes']
-        nf = args['nf']
-        in_nc = args['in_nc']
-        out_nc = args['out_nc']
+        nframes = self.args['nframes']
+        nf = self.args['nf']
+        in_nc = self.args['in_nc']
+        out_nc = self.args['out_nc']
         
-        # Bayer预处理（可选）
-        self.use_bayer_preprocess = args.get('use_bayer_preprocess', True)
-        if self.use_bayer_preprocess:
-            self.bayer_preprocess = LightweightBayerPreprocess()
-            actual_in_nc = in_nc * 4  # RGGB展开
-        else:
-            actual_in_nc = in_nc * nframes
+        self.use_physics = self.args.get('use_physics', True)
+        self.use_bayer_conv = self.args.get('use_bayer_conv', True)
+        self.camera_type = self.args.get('camera_type', 'SonyA7S2')
+        
+        # 使用Bayer-aware卷积或标准卷积
+        ConvBlock = BayerConvBlock if self.use_bayer_conv else nn.Conv2d
         
         # 编码器
-        self.conv1 = ConvBlock(actual_in_nc, nf)
+        if self.use_bayer_conv:
+            self.conv1_1 = BayerConvBlock(in_nc * nframes, nf)
+            self.conv1_2 = BayerConvBlock(nf, nf)
+        else:
+            self.conv1_1 = nn.Conv2d(in_nc * nframes, nf, 3, padding=1)
+            self.conv1_2 = nn.Conv2d(nf, nf, 3, padding=1)
         self.pool1 = nn.MaxPool2d(2)
         
-        self.conv2 = ConvBlock(nf, nf*2)
+        self.conv2_1 = nn.Conv2d(nf, nf*2, 3, padding=1)
+        self.conv2_2 = nn.Conv2d(nf*2, nf*2, 3, padding=1)
         self.pool2 = nn.MaxPool2d(2)
         
-        self.conv3 = ConvBlock(nf*2, nf*4, use_depthwise=True)
+        self.conv3_1 = nn.Conv2d(nf*2, nf*4, 3, padding=1)
+        self.conv3_2 = nn.Conv2d(nf*4, nf*4, 3, padding=1)
         self.pool3 = nn.MaxPool2d(2)
         
-        self.conv4 = ConvBlock(nf*4, nf*8, use_depthwise=True)
+        self.conv4_1 = nn.Conv2d(nf*4, nf*8, 3, padding=1)
+        self.conv4_2 = nn.Conv2d(nf*8, nf*8, 3, padding=1)
         self.pool4 = nn.MaxPool2d(2)
         
-        # 瓶颈层 + 物理约束
-        self.conv5 = ConvBlock(nf*8, nf*16, use_depthwise=True)
+        self.conv5_1 = nn.Conv2d(nf*8, nf*16, 3, padding=1)
+        self.conv5_2 = nn.Conv2d(nf*16, nf*16, 3, padding=1)
         
-        # 物理约束模块（在多个尺度应用）
-        self.use_physics = args.get('use_physics', True)
+        # 物理约束模块（在不同尺度应用）
         if self.use_physics:
-            self.physics_module1 = PhysicsConstraintModule(nf*16, args.get('iso_levels', 10))
-            self.physics_module2 = PhysicsConstraintModule(nf*8, args.get('iso_levels', 10))
-            self.physics_module3 = PhysicsConstraintModule(nf*4, args.get('iso_levels', 10))
+            self.physics1 = PhysicsConstraintBlock(nf)
+            self.physics2 = PhysicsConstraintBlock(nf*4)
+            self.physics3 = PhysicsConstraintBlock(nf*16)
         
         # 解码器
-        self.up6 = nn.ConvTranspose2d(nf*16, nf*8, 2, stride=2)
-        self.conv6 = ConvBlock(nf*16, nf*8, use_depthwise=True)  # concat后是nf*16
+        self.upv6 = nn.ConvTranspose2d(nf*16, nf*8, 2, stride=2)
+        self.conv6_1 = nn.Conv2d(nf*16, nf*8, 3, padding=1)
+        self.conv6_2 = nn.Conv2d(nf*8, nf*8, 3, padding=1)
         
-        self.up7 = nn.ConvTranspose2d(nf*8, nf*4, 2, stride=2)
-        self.conv7 = ConvBlock(nf*8, nf*4, use_depthwise=True)
+        self.upv7 = nn.ConvTranspose2d(nf*8, nf*4, 2, stride=2)
+        self.conv7_1 = nn.Conv2d(nf*8, nf*4, 3, padding=1)
+        self.conv7_2 = nn.Conv2d(nf*4, nf*4, 3, padding=1)
         
-        self.up8 = nn.ConvTranspose2d(nf*4, nf*2, 2, stride=2)
-        self.conv8 = ConvBlock(nf*4, nf*2)
+        self.upv8 = nn.ConvTranspose2d(nf*4, nf*2, 2, stride=2)
+        self.conv8_1 = nn.Conv2d(nf*4, nf*2, 3, padding=1)
+        self.conv8_2 = nn.Conv2d(nf*2, nf*2, 3, padding=1)
         
-        self.up9 = nn.ConvTranspose2d(nf*2, nf, 2, stride=2)
-        self.conv9 = ConvBlock(nf*2, nf)
+        self.upv9 = nn.ConvTranspose2d(nf*2, nf, 2, stride=2)
+        self.conv9_1 = nn.Conv2d(nf*2, nf, 3, padding=1)
+        self.conv9_2 = nn.Conv2d(nf, nf, 3, padding=1)
         
-        # 输出层
-        self.conv10 = nn.Conv2d(nf, out_nc, 1)
+        self.conv10_1 = nn.Conv2d(nf, out_nc, 1)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
         
-        # 残差连接（可选）
-        self.res = args.get('res', True)
-        if self.res:
-            if self.use_bayer_preprocess:
-                self.res_conv = nn.Conv2d(in_nc*4, out_nc, 1)
-            else:
-                self.res_conv = nn.Conv2d(in_nc*nframes, out_nc, 1)
+        # 残差连接
+        self.res = self.args.get('res', True)
         
-        # 初始化权重
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x, iso_idx=None):
+    def forward(self, x, noise_params=None, iso=None):
         """
-        x: 输入张量 [B, C, H, W]
-        iso_idx: ISO索引 [B] (可选)
+        x: 输入RGGB图像 [B, 4, H, W]
+        noise_params: 噪声参数字典 (从PMN获取)
+        iso: ISO值 [B] (用于生成噪声图)
         """
-        # Bayer预处理
-        if self.use_bayer_preprocess:
-            x = self.bayer_preprocess(x)
-        
-        # 保存输入用于残差连接
-        input_x = x
+        # 生成噪声图（使用PMN的噪声模型）
+        noise_map = None
+        if self.use_physics and (noise_params is not None or iso is not None):
+            try:
+                # 使用PMN的噪声图生成
+                noise_map = generate_noise_map(
+                    x, 
+                    noise_params=noise_params,
+                    iso=iso,
+                    camera_name=self.camera_type
+                )
+                
+                # 转换为合适的尺寸
+                if isinstance(noise_map, np.ndarray):
+                    noise_map = torch.from_numpy(noise_map).float()
+                if noise_map.dim() == 3:
+                    noise_map = noise_map.unsqueeze(1)  # 添加通道维度
+                    
+                # 对RGGB取平均得到单通道噪声图
+                if noise_map.shape[1] == 4:
+                    noise_map = noise_map.mean(dim=1, keepdim=True)
+                    
+            except Exception as e:
+                print(f"Warning: Failed to generate noise map: {e}")
+                noise_map = None
         
         # 编码路径
-        conv1 = self.conv1(x)
-        pool1 = self.pool1(conv1)
-        
-        conv2 = self.conv2(pool1)
-        pool2 = self.pool2(conv2)
-        
-        conv3 = self.conv3(pool2)
-        pool3 = self.pool3(conv3)
-        
-        conv4 = self.conv4(pool3)
-        pool4 = self.pool4(conv4)
-        
-        # 瓶颈层
-        conv5 = self.conv5(pool4)
+        conv1 = self.relu(self.conv1_1(x))
+        conv1 = self.relu(self.conv1_2(conv1))
         
         # 应用物理约束
-        if self.use_physics and iso_idx is not None:
-            conv5 = self.physics_module1(conv5, iso_idx)
+        if self.use_physics and noise_map is not None:
+            conv1 = self.physics1(conv1, noise_map)
+        
+        pool1 = self.pool1(conv1)
+        
+        conv2 = self.relu(self.conv2_1(pool1))
+        conv2 = self.relu(self.conv2_2(conv2))
+        pool2 = self.pool2(conv2)
+        
+        conv3 = self.relu(self.conv3_1(pool2))
+        conv3 = self.relu(self.conv3_2(conv3))
+        
+        # 应用物理约束
+        if self.use_physics and noise_map is not None:
+            # 下采样噪声图
+            noise_map_down2 = F.avg_pool2d(noise_map, 4)
+            conv3 = self.physics2(conv3, noise_map_down2)
+        
+        pool3 = self.pool3(conv3)
+        
+        conv4 = self.relu(self.conv4_1(pool3))
+        conv4 = self.relu(self.conv4_2(conv4))
+        pool4 = self.pool4(conv4)
+        
+        conv5 = self.relu(self.conv5_1(pool4))
+        conv5 = self.relu(self.conv5_2(conv5))
+        
+        # 应用物理约束
+        if self.use_physics and noise_map is not None:
+            # 下采样噪声图
+            noise_map_down4 = F.avg_pool2d(noise_map, 16)
+            conv5 = self.physics3(conv5, noise_map_down4)
         
         # 解码路径
-        up6 = self.up6(conv5)
-        merge6 = torch.cat([conv4, up6], dim=1)
-        conv6 = self.conv6(merge6)
-        if self.use_physics and iso_idx is not None:
-            conv6 = self.physics_module2(conv6, iso_idx)
+        up6 = self.upv6(conv5)
+        up6 = torch.cat([up6, conv4], 1)
+        conv6 = self.relu(self.conv6_1(up6))
+        conv6 = self.relu(self.conv6_2(conv6))
         
-        up7 = self.up7(conv6)
-        merge7 = torch.cat([conv3, up7], dim=1)
-        conv7 = self.conv7(merge7)
-        if self.use_physics and iso_idx is not None:
-            conv7 = self.physics_module3(conv7, iso_idx)
+        up7 = self.upv7(conv6)
+        up7 = torch.cat([up7, conv3], 1)
+        conv7 = self.relu(self.conv7_1(up7))
+        conv7 = self.relu(self.conv7_2(conv7))
         
-        up8 = self.up8(conv7)
-        merge8 = torch.cat([conv2, up8], dim=1)
-        conv8 = self.conv8(merge8)
+        up8 = self.upv8(conv7)
+        up8 = torch.cat([up8, conv2], 1)
+        conv8 = self.relu(self.conv8_1(up8))
+        conv8 = self.relu(self.conv8_2(conv8))
         
-        up9 = self.up9(conv8)
-        merge9 = torch.cat([conv1, up9], dim=1)
-        conv9 = self.conv9(merge9)
+        up9 = self.upv9(conv8)
+        up9 = torch.cat([up9, conv1], 1)
+        conv9 = self.relu(self.conv9_1(up9))
+        conv9 = self.relu(self.conv9_2(conv9))
         
-        # 输出
-        out = self.conv10(conv9)
+        conv10 = self.conv10_1(conv9)
         
         # 残差连接
         if self.res:
-            out = out + self.res_conv(input_x)
-        
+            out = conv10 + x
+        else:
+            out = conv10
+            
         return out
     
-    def count_parameters(self):
-        """计算模型参数量"""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    def get_noise_params(self, data):
+        """从数据中提取噪声参数（兼容PMN框架）"""
+        if 'noise_params' in data:
+            return data['noise_params']
+        
+        # 尝试从ISO获取
+        if 'ISO' in data:
+            iso = data['ISO']
+            if hasattr(iso, 'item'):
+                iso = iso.item()
+            
+            # 使用PMN的噪声参数获取函数
+            try:
+                params = sample_params_max(
+                    camera_type=self.camera_type,
+                    iso=iso
+                )
+                return params
+            except:
+                return None
+        
+        return None
+
+
+class PBNet_DSC(PBNet):
+    """PBNet with Dark Shading Correction - 集成暗影校正"""
+    def __init__(self, args=None):
+        super().__init__(args)
+        # 此版本假设暗影校正已在预处理中完成
+        self.name = 'PBNet_DSC'
+
+
+# 兼容性函数
+def UNetSeeInDark_Physics(args=None):
+    """创建PBNet，兼容原始UNet接口"""
+    return PBNet(args)
+
+
+# 测试函数
+def test_pbnet_pmn():
+    """测试PBNet与PMN框架的集成"""
+    import torch
     
-    def get_model_info(self):
-        """获取模型信息"""
-        param_count = self.count_parameters()
-        info = {
-            'name': 'PBNet',
-            'parameters': param_count,
-            'parameters_str': f'{param_count/1e6:.2f}M',
-            'use_physics': self.use_physics,
-            'use_bayer_preprocess': self.use_bayer_preprocess,
-            'base_channels': self.args['nf']
-        }
-        return info
+    # 创建模型
+    args = {
+        'nframes': 1,
+        'in_nc': 4,
+        'out_nc': 4,
+        'nf': 32,
+        'res': True,
+        'use_physics': True,
+        'use_bayer_conv': True,
+        'camera_type': 'SonyA7S2'
+    }
+    
+    model = PBNet(args)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    
+    # 测试输入
+    batch_size = 2
+    x = torch.randn(batch_size, 4, 128, 128)  # RGGB输入
+    iso = torch.tensor([1600, 3200])
+    
+    # 前向传播
+    with torch.no_grad():
+        output = model(x, iso=iso)
+        print(f"Input shape: {x.shape}")
+        print(f"Output shape: {output.shape}")
+    
+    # 测试噪声参数传递
+    noise_params = {
+        'K': 0.5,
+        'sigGs': 0.01,
+        'sigTL': 0.02,
+        'wp': 16383,
+        'bl': 512
+    }
+    
+    with torch.no_grad():
+        output = model(x, noise_params=noise_params)
+        print("Test with noise params passed!")
+    
+    return model
 
 
 class PBNetLoss(nn.Module):
-    """PBNet的损失函数，包含物理一致性约束"""
-    def __init__(self, args=None):
+    """PBNet的损失函数，集成物理约束"""
+    
+    def __init__(self, camera_type='SonyA7S2', lambda_physics=0.1):
         super().__init__()
-        self.l1_loss = nn.L1Loss()
+        from losses import Unet_Loss
+        self.base_loss = Unet_Loss()
+        self.lambda_physics = lambda_physics
+        self.camera_type = camera_type
         self.l2_loss = nn.MSELoss()
         
-        # 权重
-        self.lambda_l1 = args.get('lambda_l1', 1.0)
-        self.lambda_physics = args.get('lambda_physics', 0.1)
-        self.lambda_perceptual = args.get('lambda_perceptual', 0.0)
-        
-        # 物理参数
-        self.register_buffer('system_gain', torch.linspace(0.1, 2.0, 10))
-        self.register_buffer('read_noise_var', torch.tensor(0.01))
-    
-    def compute_physics_loss(self, output, noisy, iso_idx):
-        """计算物理一致性损失"""
-        # 获取系统增益
-        gain = self.system_gain[iso_idx].view(-1, 1, 1, 1)
-        
+    def compute_physics_loss(self, output, noisy, noise_params=None, iso=None):
+        """计算物理约束损失"""
         # 计算残差
         residual = noisy - output
         
-        # 理论噪声方差（简化的Poisson-Gaussian模型）
-        expected_var = gain * output.clamp(min=1e-3) + self.read_noise_var
+        # 获取噪声参数
+        K = 0.1  # 默认值
+        sigma_read = 0.01
         
-        # 实际噪声方差（局部估计）
+        if noise_params is not None:
+            K = noise_params.get('K', noise_params.get('Kmax', K))
+            sigma_read = noise_params.get('sigGs', sigma_read)
+        elif iso is not None:
+            # 从ISO估算参数
+            try:
+                from data_process.process import get_camera_noisy_params_max
+                params = get_camera_noisy_params_max(f"{self.camera_type}_{int(iso)}")
+                if params:
+                    K = params.get('Kmax', K)
+                    sigma_read = params.get('sigGs', sigma_read)
+            except:
+                pass
+        
+        # 转换为张量
+        if not isinstance(K, torch.Tensor):
+            K = torch.tensor(K, device=output.device, dtype=output.dtype)
+        if not isinstance(sigma_read, torch.Tensor):
+            sigma_read = torch.tensor(sigma_read, device=output.device, dtype=output.dtype)
+        
+        # Poisson-Gaussian模型：Var = K * I + sigma_read^2
+        expected_var = K * output.clamp(min=0) + sigma_read ** 2
+        
+        # 计算局部方差
         kernel_size = 5
+        pad = kernel_size // 2
         residual_sq = residual ** 2
-        actual_var = F.avg_pool2d(residual_sq, kernel_size, stride=1, padding=kernel_size//2)
+        actual_var = F.avg_pool2d(residual_sq, kernel_size, stride=1, padding=pad)
         
         # 物理一致性损失
         physics_loss = self.l2_loss(actual_var, expected_var)
         
         return physics_loss
     
-    def forward(self, output, target, noisy=None, iso_idx=None):
-        """
-        output: 网络输出
-        target: 真实值
-        noisy: 噪声输入（用于物理约束）
-        iso_idx: ISO索引
-        """
-        losses = {}
+    def forward(self, output, target, noisy=None, noise_params=None, iso=None):
+        """计算总损失"""
+        # 基础L1损失
+        l1_loss = self.base_loss(output, target)
         
-        # 主要重建损失
-        l1_loss = self.l1_loss(output, target)
-        losses['l1'] = l1_loss
-        
-        # 物理一致性损失
-        if noisy is not None and iso_idx is not None and self.lambda_physics > 0:
-            physics_loss = self.compute_physics_loss(output, noisy, iso_idx)
-            losses['physics'] = physics_loss
+        # 物理约束损失
+        if self.lambda_physics > 0 and noisy is not None:
+            physics_loss = self.compute_physics_loss(output, noisy, noise_params, iso)
+            total_loss = l1_loss + self.lambda_physics * physics_loss
+            return total_loss, {'l1': l1_loss.item(), 'physics': physics_loss.item()}
         else:
-            losses['physics'] = torch.tensor(0.0).to(output.device)
-        
-        # 总损失
-        total_loss = self.lambda_l1 * losses['l1'] + self.lambda_physics * losses['physics']
-        losses['total'] = total_loss
-        
-        return losses
-
-
-def create_pbnet(args=None):
-    """创建PBNet模型"""
-    model = PBNet(args)
-    return model
-
-
-def test_pbnet():
-    """测试PBNet模型"""
-    # 测试参数
-    args = {
-        'nframes': 1,
-        'in_nc': 4,
-        'out_nc': 3,
-        'nf': 32,
-        'iso_levels': 10,
-        'use_physics': True,
-        'use_bayer_preprocess': True
-    }
-    
-    # 创建模型
-    model = create_pbnet(args)
-    
-    # 打印模型信息
-    info = model.get_model_info()
-    print(f"Model: {info['name']}")
-    print(f"Parameters: {info['parameters_str']}")
-    print(f"Use Physics: {info['use_physics']}")
-    print(f"Use Bayer Preprocess: {info['use_bayer_preprocess']}")
-    
-    # 测试前向传播
-    batch_size = 2
-    height, width = 128, 128
-    x = torch.randn(batch_size, 4, height, width)
-    iso_idx = torch.tensor([0, 1])  # ISO索引
-    
-    # 前向传播
-    with torch.no_grad():
-        output = model(x, iso_idx)
-    
-    print(f"\nInput shape: {x.shape}")
-    print(f"Output shape: {output.shape}")
-    
-    # 测试损失函数
-    loss_fn = PBNetLoss(args)
-    target = torch.randn_like(output)
-    noisy = x[:, :3, :, :] if x.shape[1] > 3 else x[:, :1, :, :].repeat(1, 3, 1, 1)
-    
-    losses = loss_fn(output, target, noisy, iso_idx)
-    print(f"\nLosses:")
-    for k, v in losses.items():
-        print(f"  {k}: {v.item():.4f}")
+            return l1_loss, {'l1': l1_loss.item(), 'physics': 0}
 
 
 if __name__ == '__main__':
-    test_pbnet()
+    test_pbnet_pmn()

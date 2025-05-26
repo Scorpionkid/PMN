@@ -67,7 +67,18 @@ class SID_Trainer(Base_Trainer):
 
 
         self.net = self.net.to(self.device)
-        self.loss = Unet_Loss()
+        if self.arch['name'] == 'PBNet':
+            # 使用PBNet专用损失函数
+            self.loss = PBNetLoss(
+                camera_type=self.dst['camera_type'],
+                lambda_l1=1.0,
+                lambda_physics=0.1,
+                lambda_perceptual=0.0
+            )
+        else:
+            # 使用原有损失函数
+            self.loss = Unet_Loss()
+            
         # 添加感知损失
         if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
             self.perceptual_loss = VGGPerceptualLoss().to(self.device)
@@ -188,7 +199,17 @@ class SID_Trainer(Base_Trainer):
                     
                     # 训练
                     self.optimizer.zero_grad()
-                    if noise_map is not None:
+                    if self.arch['name'] == 'PBNet':
+                        iso = data.get('ISO', None)
+                        pred = self.net(imgs_lr, iso=iso)
+                        
+                        # 计算损失（包含物理约束）
+                        if isinstance(self.loss, PBNetLoss):
+                            loss, loss_dict = self.loss(
+                                pred.clamp(0,1), imgs_hr, 
+                                noisy=imgs_lr, iso=iso
+                            )
+                    elif noise_map is not None:
                         outputs = self.net(imgs_lr, noise_map)
                         # 检查输出格式
                         if isinstance(outputs, tuple) and len(outputs) == 4:
@@ -351,7 +372,10 @@ class SID_Trainer(Base_Trainer):
                     if imgs_lr.shape[-1] % 16 != 0:
                         p2d = (4,4,4,4)
                         imgs_lr = F.pad(imgs_lr, p2d, mode='reflect')
-                        if noise_map is not None:
+                        if self.arch['name'] == 'PBNet':
+                            iso = data.get('ISO', None)
+                            imgs_dn = self.net(imgs_lr, iso=iso)
+                        elif noise_map is not None:
                             imgs_dn = self.net(imgs_lr, noise_map)
                         else:
                             imgs_dn = self.net(imgs_lr)
@@ -364,7 +388,10 @@ class SID_Trainer(Base_Trainer):
                         imgs_lr = imgs_lr[..., 4:-4, 4:-4]
                         imgs_dn = imgs_dn[..., 4:-4, 4:-4]
                     else:
-                        if noise_map is not None:
+                        if self.arch['name'] == 'PBNet':
+                            iso = data.get('ISO', None)
+                            imgs_dn = self.net(imgs_lr, iso=iso)
+                        elif noise_map is not None:
                             imgs_dn = self.net(imgs_lr, noise_map)
                         else:
                             imgs_dn = self.net(imgs_lr)
