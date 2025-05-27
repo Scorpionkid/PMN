@@ -67,18 +67,7 @@ class SID_Trainer(Base_Trainer):
 
 
         self.net = self.net.to(self.device)
-        if self.arch['name'] == 'PBNet':
-            # 使用PBNet专用损失函数
-            self.loss = PBNetLoss(
-                camera_type=self.dst['camera_type'],
-                lambda_l1=1.0,
-                lambda_physics=0.1,
-                lambda_perceptual=0.0
-            )
-        else:
-            # 使用原有损失函数
-            self.loss = Unet_Loss()
-            
+        self.loss = Unet_Loss()
         # 添加感知损失
         if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
             self.perceptual_loss = VGGPerceptualLoss().to(self.device)
@@ -199,17 +188,7 @@ class SID_Trainer(Base_Trainer):
                     
                     # 训练
                     self.optimizer.zero_grad()
-                    if self.arch['name'] == 'PBNet':
-                        iso = data.get('ISO', None)
-                        pred = self.net(imgs_lr, iso=iso)
-                        
-                        # 计算损失（包含物理约束）
-                        if isinstance(self.loss, PBNetLoss):
-                            loss, loss_dict = self.loss(
-                                pred.clamp(0,1), imgs_hr, 
-                                noisy=imgs_lr, iso=iso
-                            )
-                    elif noise_map is not None:
+                    if noise_map is not None:
                         outputs = self.net(imgs_lr, noise_map)
                         # 检查输出格式
                         if isinstance(outputs, tuple) and len(outputs) == 4:
@@ -255,7 +234,7 @@ class SID_Trainer(Base_Trainer):
                         self.train_psnr.update(psnr.item())
 
                     # 格式化损失值用于显示
-                    loss_str = ' '.join([f"{k}:{v:.4f}" for k, v in loss_values.items()])
+                    # loss_str = ' '.join([f"{k}:{v:.4f}" for k, v in loss_values.items()])
                     
                     runtime['total'] = runtime['preprocess']+runtime['dataloader']+runtime['net']+runtime['bp']
                     t.set_description(f'Epoch {epoch}')
@@ -264,7 +243,8 @@ class SID_Trainer(Base_Trainer):
                                     # 'process':f"{100*runtime['preprocess']/runtime['total']:.1f}%",
                                     # 'net':f"{100*runtime['net']/runtime['total']:.1f}%",
                                     # 'bp':f"{100*runtime['bp']/runtime['total']:.1f}%",
-                                    'loss': loss_str})
+                                    # 'loss': loss_str
+                                    })
                     t.update(1)
                     time_points[0] = time.time()
 
@@ -320,7 +300,16 @@ class SID_Trainer(Base_Trainer):
                 model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
                 if os.path.exists(model_path):
                     model = torch.load(model_path, map_location=self.device)
-                    self.net = load_weights(self.net, model, self.multi_gpu, by_name=True)
+
+                    # 检查加载的文件是新格式还是旧格式
+                    if isinstance(model, dict) and 'model' in model:
+                        # 新格式：包含完整训练状态
+                        model_weights = model['model']
+                    else:
+                        # 旧格式：仅包含模型权重
+                        model_weights = model
+
+                    self.net = load_weights(self.net, model_weights, self.multi_gpu, by_name=True)
                     log(f'Successfully reload best model (Eval PSNR:{self.best_psnr})',
                         log=f'./logs/log_{self.model_name}.log')
 
@@ -367,15 +356,14 @@ class SID_Trainer(Base_Trainer):
                     # croped_imgs_dn = torch.cat(croped_imgs_dn)
                     # imgs_lr = self.dst_eval.eval_merge(croped_imgs_lr)
                     # imgs_dn = self.dst_eval.eval_merge(croped_imgs_dn)
-
+                    
+                    detail_output = None
+                    denoise_output = None
                     # 扛得住就pad再crop
                     if imgs_lr.shape[-1] % 16 != 0:
                         p2d = (4,4,4,4)
                         imgs_lr = F.pad(imgs_lr, p2d, mode='reflect')
-                        if self.arch['name'] == 'PBNet':
-                            iso = data.get('ISO', None)
-                            imgs_dn = self.net(imgs_lr, iso=iso)
-                        elif noise_map is not None:
+                        if noise_map is not None:
                             imgs_dn = self.net(imgs_lr, noise_map)
                         else:
                             imgs_dn = self.net(imgs_lr)
@@ -388,10 +376,7 @@ class SID_Trainer(Base_Trainer):
                         imgs_lr = imgs_lr[..., 4:-4, 4:-4]
                         imgs_dn = imgs_dn[..., 4:-4, 4:-4]
                     else:
-                        if self.arch['name'] == 'PBNet':
-                            iso = data.get('ISO', None)
-                            imgs_dn = self.net(imgs_lr, iso=iso)
-                        elif noise_map is not None:
+                        if noise_map is not None:
                             imgs_dn = self.net(imgs_lr, noise_map)
                         else:
                             imgs_dn = self.net(imgs_lr)
@@ -452,7 +437,8 @@ class SID_Trainer(Base_Trainer):
                                 output = raw2rgb_rawpy(imgs_dn, wb=wb, ccm=ccm)
                                 detail_rgb = raw2rgb_rawpy(detail_output, wb=wb, ccm=ccm) if detail_output is not None else None
                                 denoise_rgb = raw2rgb_rawpy(denoise_output, wb=wb, ccm=ccm) if denoise_output is not None else None
-                            raw_metrics = None # 用RGB metrics
+
+                            # raw_metrics = None # 用RGB metrics
 
                             # task_list.append(
                             #     pool.submit(plot_dual_path_sample, inputs, output, target, 
@@ -573,11 +559,6 @@ class SID_Trainer(Base_Trainer):
         # self.use_gpu = True
         dst = self.dst_train if mode=='train' else self.dst_eval
 
-        # 处理噪声图(如果存在)
-        noise_map = None
-        if 'noise_map' in data:
-            noise_map = tensor_dim5to4(data['noise_map']).type(torch.FloatTensor).to(self.device)
-            data['noise_map'] = noise_map
 
         if self.use_gpu and mode=='train' and preprocess:
             b = imgs_lr.shape[0]
@@ -587,6 +568,7 @@ class SID_Trainer(Base_Trainer):
                 aug_wbs = torch.stack((aug_r, aug_g, aug_b, aug_g), dim=1)
                 data['rgb_gain'] = torch.ones(b) * (aug_g + 1)
                 data['wb'] = data['wb'][0].repeat(b, 1)
+                noise_params = []       
                 for i in range(b):
                     aug_wb = aug_wbs[i].numpy()
                     if data['black_lr'][0]: aug_wb += 1
@@ -595,11 +577,33 @@ class SID_Trainer(Base_Trainer):
                     if np.abs(aug_wb).max() != 0:
                         data['wb'][i] *= (1+aug_wb[1]) / (1+aug_wb)
                         iso = data['ISO'][i//self.dst['crop_per_image']].item()
-                        dn, dy = SNA_torch(imgs_hr[i], aug_wb, iso=iso, ratio=dgain, black_lr=data['black_lr'][0],
+                        dn, dy, p = SNA_torch(imgs_hr[i], aug_wb, iso=iso, ratio=dgain, black_lr=data['black_lr'][0],
                             camera_type=self.dst['camera_type'], ori=self.dst['ori'])
                         imgs_lr[i] = imgs_lr[i] + dn 
                         imgs_hr[i] = imgs_hr[i] + dy
+                        noise_params.append({
+                            'K': p['K'],
+                            'sigGs': p['sigGs'], 
+                            'wp': p['wp'],
+                            'bl': p['bl']
+                        })
+                    else:
+                        # 原始数据：根据ISO估算参数
+                        iso = data['ISO'][i//self.dst['crop_per_image']].item()
+                        estimated_params = get_camera_noisy_params_max(f'{self.dst["camera_type"]}_{iso}')
+                        noise_params.append(estimated_params)
+                data['noise_parms'] = noise_params
 
+                # TODO：noisemap
+                if self.arch.get('use_noise_map', False):
+                    noise_map = self.generate_noise_map_batch(imgs_lr, noise_params)
+                    data['noise_map'] = noise_map
+
+                # 处理噪声图(如果存在)
+                noise_map = None
+                if 'noise_map' in data:
+                    noise_map = tensor_dim5to4(data['noise_map']).type(torch.FloatTensor).to(self.device)
+                    
             elif self.args['dst_train']['dataset'] == 'Raw_Dataset':
                 data['ratio'] = torch.ones(b, device=self.device)
                 # 人工加噪声，注意，这里统一时间的视频应该共享相同的噪声参数！！
@@ -734,6 +738,57 @@ class SID_Trainer(Base_Trainer):
         #     if 'cuda' in checkpoint['random_state'] and checkpoint['random_state']['cuda'] is not None:
         #         torch.cuda.set_rng_state_all(checkpoint['random_state']['cuda'])
 
+    def generate_noise_map_batch(self, images, noise_params_list):
+        """为一个batch生成噪声图"""
+        noise_maps = []
+        
+        for i, (img, params) in enumerate(zip(images, noise_params_list)):
+            # 使用实际的噪声参数生成噪声图
+            noise_map = generate_noise_map(
+                image=img.cpu().numpy(),
+                noise_params=params
+            )
+            noise_maps.append(noise_map)
+
+        # 添加归一化处理
+        if noise_maps is not None:
+            # 判断是否为PyTorch张量
+            is_tensor = torch.is_tensor(noise_maps)
+            
+            # 遍历每个裁剪样本进行归一化
+            # [crop_per_image, C, H, W]
+            normalized_maps = []
+            for single_map in noise_maps:
+                
+                if is_tensor:
+                    map_min = torch.min(single_map)
+                    map_max = torch.max(single_map)
+                    
+                    # 避免除零错误
+                    if map_max - map_min > 1e-6:
+                        normalized = (single_map - map_min) / (map_max - map_min)
+                    else:
+                        normalized = torch.zeros_like(single_map) + 0.5
+                else:
+                    map_min = np.min(single_map)
+                    map_max = np.max(single_map)
+                    
+                    # 避免除零错误
+                    if map_max - map_min > 1e-6:
+                        normalized = (single_map - map_min) / (map_max - map_min)
+                    else:
+                        normalized = np.zeros_like(single_map) + 0.5
+                
+                normalized_maps.append(normalized)
+            
+            # 重新组合批次
+            if is_tensor:
+                noise_maps = torch.stack(normalized_maps, dim=0)
+            else:
+                noise_maps = np.stack(normalized_maps, axis=0)
+        
+        return np.stack(noise_maps, axis=0)
+
 def MultiProcessPlot(imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch, 
                     raw_metrics, infos, model_name, sample_dir):
     if infos is None:
@@ -767,7 +822,19 @@ if __name__ == '__main__':
     if os.path.exists(best_model_path) is False: 
         best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
     best_model = torch.load(best_model_path, map_location=trainer.device)
-    trainer.net = load_weights(trainer.net, best_model, multi_gpu=trainer.multi_gpu)
+
+    # 检查加载的文件是新格式还是旧格式
+    if isinstance(best_model, dict) and 'model' in best_model:
+        # 新格式：包含完整训练状态
+        model_weights = best_model['model']
+        log(f"加载新格式模型权重用于评估")
+        log(f"Epoch{best_model['epoch']}, Best_PSNR{best_model['best_psnr']}")
+    else:
+        # 旧格式：仅包含模型权重
+        model_weights = best_model
+        log(f"加载旧格式模型权重用于评估")
+
+    trainer.net = load_weights(trainer.net, model_weights, multi_gpu=trainer.multi_gpu)
     if 'eval' in trainer.mode:
         # ELD
         trainer.change_eval_dst('eval')

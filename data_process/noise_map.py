@@ -24,13 +24,8 @@ def generate_noise_map(image, noise_params=None, camera_params=None, iso=None, c
     # Method 1: Use noise parameters directly from noise generator (preferred method)
     if noise_params is not None and 'shot' in noise_params:
         # Get noise parameters
-        K = noise_params['shot']  # Corresponds to shot noise parameter K
-        if 'read' in noise_params:
-            sigma_r = noise_params['read'] if isinstance(noise_params['read'], torch.Tensor) else noise_params['read']['sigma']
-        else:
-            sigma_r = torch.tensor(0.01) if is_tensor else 0.01
-            if is_tensor:
-                sigma_r = sigma_r.to(device)
+        K = noise_params['K']  # 直接使用SNA_torch的参数结构
+        sigma_r = noise_params['sigGs']
 
     # Method 2: Calculate K from ISO values (fallback method)
     elif iso is not None:
