@@ -29,6 +29,7 @@ def generate_noise_map(image, noise_params=None, camera_params=None, iso=None, c
 
     # If no valid parameters are available, return None
     else:
+        print("Warning: No valid noise parameters provided, cannot generate noise map.")
         return None
 
     # Calculate standard deviation noise map: sqrt(K*R + sigma_r^2)

@@ -1,6 +1,5 @@
 """
-PBNet: Physics-Based Network for Raw Image Denoising
-基于PMN框架的物理约束网络实现
+PBNet: Physics-Based Network - 全BayerConvBlock版本
 """
 
 import torch
@@ -8,123 +7,108 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from .modules import *
-from typing import Optional, Dict, Any
-
-# 从PMN框架导入噪声处理函数
-try:
-    from data_process.process import get_camera_noisy_params_max, sample_params_max
-    from data_process.noise_map import generate_noise_map
-except:
-    print("Warning: PMN noise processing modules not found")
 
 
-class PhysicsConstraintBlock(nn.Module):
-    """物理约束块 - 使用PMN的噪声参数"""
-    def __init__(self, channels, reduction=4):
+class LightweightPhysicsBlock(nn.Module):
+    """物理约束块 - 修正版本"""
+    def __init__(self, channels, reduction=8):
         super().__init__()
         self.channels = channels
         
-        # 噪声参数调制网络
+        # reduction ratio解释：
+        # 输入channels → channels//reduction → channels
+        # 例如：256 → 32 → 256，大幅减少参数量
+        mid_channels = max(channels // reduction, 8)
+        
         self.noise_modulator = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels + 1, channels // reduction, 1),  # +1 for noise map
+            nn.Conv2d(channels, mid_channels, 1),  # 压缩阶段
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Conv2d(mid_channels, channels, 1),  # 恢复阶段
             nn.Sigmoid()
         )
         
-        # 残差生成
-        self.residual_conv = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),  # 深度卷积
-            nn.Conv2d(channels, channels, 1),  # 逐点卷积
-            nn.Tanh()
-        )
+        self.residual_conv = nn.Conv2d(channels, channels, 1)
+
+    def _downsample_noise_map(self, noise_map, target_size):
+        current_h, current_w = noise_map.shape[-2:]
+        target_h, target_w = target_size
+        
+        # 计算需要的池化倍数
+        scale_h = current_h // target_h
+        scale_w = current_w // target_w
+        
+        if scale_h > 1 or scale_w > 1:
+            # 使用平均池化缩小
+            kernel_size = max(scale_h, scale_w)
+            noise_map = F.avg_pool2d(noise_map, kernel_size=kernel_size, stride=kernel_size)
+            
+            # 如果还不匹配，进行自适应池化
+            if noise_map.shape[-2:] != target_size:
+                noise_map = F.adaptive_avg_pool2d(noise_map, target_size)
+        
+        return noise_map
         
     def forward(self, x, noise_map=None):
-        """
-        x: 特征图 [B, C, H, W]
-        noise_map: 噪声图 [B, 1, H, W] (从PMN的generate_noise_map获得)
-        """
-        if noise_map is None:
-            return x
+        # 通过reduction实现轻量化的通道注意力
+        weight = self.noise_modulator(x)  # [B, C, 1, 1]
+        residual = torch.tanh(self.residual_conv(x * weight))
         
-        # 调整噪声图大小以匹配特征图
-        if noise_map.shape[-2:] != x.shape[-2:]:
-            noise_map = F.interpolate(noise_map, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        if noise_map is not None:
+            noise_map = self._downsample_noise_map(noise_map, x.shape[-2:])
+            noise_strength = torch.sqrt(noise_map.clamp(min=1e-6))
+            residual = residual * noise_strength
         
-        # 拼接特征和噪声图
-        combined = torch.cat([x, noise_map], dim=1)
-        
-        # 生成调制权重
-        weight = self.noise_modulator(combined)
-        
-        # 生成物理约束的残差
-        residual = self.residual_conv(x * weight)
-        
-        # 使用噪声图调制残差强度
-        noise_strength = torch.sqrt(noise_map.clamp(min=1e-6))
-        residual = residual * noise_strength
-        
-        return x + residual * 0.1  # 小幅残差
+        return x + residual * 0.1
 
 
 class BayerConvBlock(nn.Module):
-    """Bayer-aware卷积块 - 针对RGGB模式"""
-    def __init__(self, in_channels, out_channels, stride=1):
+    """Bayer卷积块 - 使用InstanceNorm"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, use_lightweight=False):
         super().__init__()
         
-        # RGGB通道分组处理
         assert in_channels % 4 == 0 and out_channels % 4 == 0
-        group_in = in_channels // 4
-        group_out = out_channels // 4
         
-        # 对每个Bayer通道独立处理
-        self.conv_r = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
-        self.conv_g1 = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
-        self.conv_g2 = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
-        self.conv_b = nn.Conv2d(group_in, group_out, 3, stride=stride, padding=1)
+        self.bayer_conv = nn.Conv2d(
+            in_channels, out_channels, 
+            kernel_size, stride=stride, 
+            padding=kernel_size//2, 
+            groups=4  # Bayer通道分组
+        )
         
-        # 跨通道融合
-        self.fusion = nn.Conv2d(out_channels, out_channels, 1)
-        self.norm = nn.InstanceNorm2d(out_channels)
+        if use_lightweight:
+            self.fusion = nn.Conv2d(out_channels, out_channels, 1, groups=4)
+        else:
+            self.fusion = nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, 1, groups=4),
+                nn.Conv2d(out_channels, out_channels, 1)
+            )
+        
+        # 修正：使用InstanceNorm而不是BatchNorm
+        # 原因：去噪任务中每个样本的噪声特性可能差异很大
+        self.norm = nn.InstanceNorm2d(out_channels, affine=True)
         self.relu = nn.LeakyReLU(0.2, inplace=True)
         
     def forward(self, x):
-        # 分离RGGB通道
-        B, C, H, W = x.shape
-        x_reshape = x.view(B, 4, C//4, H, W)
-        
-        # 独立处理每个通道
-        r = self.conv_r(x_reshape[:, 0])
-        g1 = self.conv_g1(x_reshape[:, 1])
-        g2 = self.conv_g2(x_reshape[:, 2])
-        b = self.conv_b(x_reshape[:, 3])
-        
-        # 合并
-        out = torch.cat([r, g1, g2, b], dim=1)
-        
-        # 跨通道融合
+        out = self.bayer_conv(x)
         out = self.fusion(out)
-        out = self.norm(out)
+        out = self.norm(out)  # 每个样本独立归一化
         out = self.relu(out)
-        
         return out
 
 
-class PBNet(nn.Module):
-    """Physics-Based Network - 基于PMN框架的物理约束网络"""
+class PBNet_AllBayer(nn.Module):
+    """全BayerConvBlock版本的PBNet"""
     def __init__(self, args=None):
         super().__init__()
         
-        # 默认参数
         self.args = args or {
             'nframes': 1,
-            'in_nc': 4,      # RGGB
-            'out_nc': 4,     # 保持RGGB输出
+            'in_nc': 4,
+            'out_nc': 4,
             'nf': 32,
             'res': True,
             'use_physics': True,
-            'use_bayer_conv': True,
             'camera_type': 'SonyA7S2'
         }
         
@@ -134,249 +118,164 @@ class PBNet(nn.Module):
         out_nc = self.args['out_nc']
         
         self.use_physics = self.args.get('use_physics', True)
-        self.use_bayer_conv = self.args.get('use_bayer_conv', True)
-        self.camera_type = self.args.get('camera_type', 'SonyA7S2')
         
-        # 使用Bayer-aware卷积或标准卷积
-        ConvBlock = BayerConvBlock if self.use_bayer_conv else nn.Conv2d
+        # 编码器 - 全部使用BayerConvBlock
+        # 前几层使用标准版，深层使用轻量版
+        self.conv1_1 = BayerConvBlock(in_nc * nframes, nf, use_lightweight=False)
+        self.conv1_2 = BayerConvBlock(nf, nf, use_lightweight=False)
         
-        # 编码器
-        if self.use_bayer_conv:
-            self.conv1_1 = BayerConvBlock(in_nc * nframes, nf)
-            self.conv1_2 = BayerConvBlock(nf, nf)
-        else:
-            self.conv1_1 = nn.Conv2d(in_nc * nframes, nf, 3, padding=1)
-            self.conv1_2 = nn.Conv2d(nf, nf, 3, padding=1)
+        self.conv2_1 = BayerConvBlock(nf, nf*2, use_lightweight=False)
+        self.conv2_2 = BayerConvBlock(nf*2, nf*2, use_lightweight=False)
+        
+        self.conv3_1 = BayerConvBlock(nf*2, nf*4, use_lightweight=True)
+        self.conv3_2 = BayerConvBlock(nf*4, nf*4, use_lightweight=True)
+        
+        self.conv4_1 = BayerConvBlock(nf*4, nf*8, use_lightweight=True)
+        self.conv4_2 = BayerConvBlock(nf*8, nf*8, use_lightweight=True)
+        
+        self.conv5_1 = BayerConvBlock(nf*8, nf*16, use_lightweight=True)
+        self.conv5_2 = BayerConvBlock(nf*16, nf*16, use_lightweight=True)
+        
         self.pool1 = nn.MaxPool2d(2)
-        
-        self.conv2_1 = nn.Conv2d(nf, nf*2, 3, padding=1)
-        self.conv2_2 = nn.Conv2d(nf*2, nf*2, 3, padding=1)
         self.pool2 = nn.MaxPool2d(2)
-        
-        self.conv3_1 = nn.Conv2d(nf*2, nf*4, 3, padding=1)
-        self.conv3_2 = nn.Conv2d(nf*4, nf*4, 3, padding=1)
         self.pool3 = nn.MaxPool2d(2)
-        
-        self.conv4_1 = nn.Conv2d(nf*4, nf*8, 3, padding=1)
-        self.conv4_2 = nn.Conv2d(nf*8, nf*8, 3, padding=1)
         self.pool4 = nn.MaxPool2d(2)
         
-        self.conv5_1 = nn.Conv2d(nf*8, nf*16, 3, padding=1)
-        self.conv5_2 = nn.Conv2d(nf*16, nf*16, 3, padding=1)
-        
-        # 物理约束模块（在不同尺度应用）
+        # 物理约束模块
         if self.use_physics:
-            self.physics1 = PhysicsConstraintBlock(nf)
-            self.physics2 = PhysicsConstraintBlock(nf*4)
-            self.physics3 = PhysicsConstraintBlock(nf*16)
+            self.physics1 = LightweightPhysicsBlock(nf)
+            self.physics3 = LightweightPhysicsBlock(nf*4)
+            self.physics5 = LightweightPhysicsBlock(nf*16)
         
-        # 解码器
+        # 解码器 - 也全部使用BayerConvBlock
         self.upv6 = nn.ConvTranspose2d(nf*16, nf*8, 2, stride=2)
-        self.conv6_1 = nn.Conv2d(nf*16, nf*8, 3, padding=1)
-        self.conv6_2 = nn.Conv2d(nf*8, nf*8, 3, padding=1)
+        self.conv6_1 = BayerConvBlock(nf*16, nf*8, use_lightweight=True)
+        self.conv6_2 = BayerConvBlock(nf*8, nf*8, use_lightweight=True)
         
         self.upv7 = nn.ConvTranspose2d(nf*8, nf*4, 2, stride=2)
-        self.conv7_1 = nn.Conv2d(nf*8, nf*4, 3, padding=1)
-        self.conv7_2 = nn.Conv2d(nf*4, nf*4, 3, padding=1)
+        self.conv7_1 = BayerConvBlock(nf*8, nf*4, use_lightweight=True)
+        self.conv7_2 = BayerConvBlock(nf*4, nf*4, use_lightweight=True)
         
         self.upv8 = nn.ConvTranspose2d(nf*4, nf*2, 2, stride=2)
-        self.conv8_1 = nn.Conv2d(nf*4, nf*2, 3, padding=1)
-        self.conv8_2 = nn.Conv2d(nf*2, nf*2, 3, padding=1)
+        self.conv8_1 = BayerConvBlock(nf*4, nf*2, use_lightweight=False)
+        self.conv8_2 = BayerConvBlock(nf*2, nf*2, use_lightweight=False)
         
         self.upv9 = nn.ConvTranspose2d(nf*2, nf, 2, stride=2)
-        self.conv9_1 = nn.Conv2d(nf*2, nf, 3, padding=1)
-        self.conv9_2 = nn.Conv2d(nf, nf, 3, padding=1)
+        self.conv9_1 = BayerConvBlock(nf*2, nf, use_lightweight=False)
+        self.conv9_2 = BayerConvBlock(nf, nf, use_lightweight=False)
         
+        # 最后的输出层使用标准卷积
         self.conv10_1 = nn.Conv2d(nf, out_nc, 1)
-        self.relu = nn.LeakyReLU(0.2, inplace=True)
         
-        # 残差连接
         self.res = self.args.get('res', True)
         
-    def forward(self, x, noise_params=None, iso=None):
+    def forward(self, x, noise_map=None):
         """
-        x: 输入RGGB图像 [B, 4, H, W]
-        noise_params: 噪声参数字典 (从PMN获取)
-        iso: ISO值 [B] (用于生成噪声图)
+        x: 输入RGGB图像 [B, 4, H, W] - 通道顺序为[R,G,B,G] 
+        noise_map: 噪声图 [B, 1, H, W]
         """
-        # 生成噪声图（使用PMN的噪声模型）
-        noise_map = None
-        if self.use_physics and (noise_params is not None or iso is not None):
-            try:
-                # 使用PMN的噪声图生成
-                noise_map = generate_noise_map(
-                    x, 
-                    noise_params=noise_params,
-                    iso=iso,
-                    camera_name=self.camera_type
-                )
-                
-                # 转换为合适的尺寸
-                if isinstance(noise_map, np.ndarray):
-                    noise_map = torch.from_numpy(noise_map).float()
-                if noise_map.dim() == 3:
-                    noise_map = noise_map.unsqueeze(1)  # 添加通道维度
-                    
-                # 对RGGB取平均得到单通道噪声图
-                if noise_map.shape[1] == 4:
-                    noise_map = noise_map.mean(dim=1, keepdim=True)
-                    
-            except Exception as e:
-                print(f"Warning: Failed to generate noise map: {e}")
-                noise_map = None
-        
         # 编码路径
-        conv1 = self.relu(self.conv1_1(x))
-        conv1 = self.relu(self.conv1_2(conv1))
+        conv1 = self.conv1_1(x)
+        conv1 = self.conv1_2(conv1)
         
-        # 应用物理约束
         if self.use_physics and noise_map is not None:
             conv1 = self.physics1(conv1, noise_map)
         
         pool1 = self.pool1(conv1)
         
-        conv2 = self.relu(self.conv2_1(pool1))
-        conv2 = self.relu(self.conv2_2(conv2))
+        conv2 = self.conv2_1(pool1)
+        conv2 = self.conv2_2(conv2)
         pool2 = self.pool2(conv2)
         
-        conv3 = self.relu(self.conv3_1(pool2))
-        conv3 = self.relu(self.conv3_2(conv3))
+        conv3 = self.conv3_1(pool2)
+        conv3 = self.conv3_2(conv3)
         
-        # 应用物理约束
         if self.use_physics and noise_map is not None:
-            # 下采样噪声图
-            noise_map_down2 = F.avg_pool2d(noise_map, 4)
-            conv3 = self.physics2(conv3, noise_map_down2)
+            conv3 = self.physics3(conv3, noise_map)
         
         pool3 = self.pool3(conv3)
         
-        conv4 = self.relu(self.conv4_1(pool3))
-        conv4 = self.relu(self.conv4_2(conv4))
+        conv4 = self.conv4_1(pool3)
+        conv4 = self.conv4_2(conv4)
         pool4 = self.pool4(conv4)
         
-        conv5 = self.relu(self.conv5_1(pool4))
-        conv5 = self.relu(self.conv5_2(conv5))
+        conv5 = self.conv5_1(pool4)
+        conv5 = self.conv5_2(conv5)
         
-        # 应用物理约束
         if self.use_physics and noise_map is not None:
-            # 下采样噪声图
-            noise_map_down4 = F.avg_pool2d(noise_map, 16)
-            conv5 = self.physics3(conv5, noise_map_down4)
+            conv5 = self.physics5(conv5, noise_map)
         
         # 解码路径
         up6 = self.upv6(conv5)
         up6 = torch.cat([up6, conv4], 1)
-        conv6 = self.relu(self.conv6_1(up6))
-        conv6 = self.relu(self.conv6_2(conv6))
+        conv6 = self.conv6_1(up6)
+        conv6 = self.conv6_2(conv6)
         
         up7 = self.upv7(conv6)
         up7 = torch.cat([up7, conv3], 1)
-        conv7 = self.relu(self.conv7_1(up7))
-        conv7 = self.relu(self.conv7_2(conv7))
+        conv7 = self.conv7_1(up7)
+        conv7 = self.conv7_2(conv7)
         
         up8 = self.upv8(conv7)
         up8 = torch.cat([up8, conv2], 1)
-        conv8 = self.relu(self.conv8_1(up8))
-        conv8 = self.relu(self.conv8_2(conv8))
+        conv8 = self.conv8_1(up8)
+        conv8 = self.conv8_2(conv8)
         
         up9 = self.upv9(conv8)
         up9 = torch.cat([up9, conv1], 1)
-        conv9 = self.relu(self.conv9_1(up9))
-        conv9 = self.relu(self.conv9_2(conv9))
+        conv9 = self.conv9_1(up9)
+        conv9 = self.conv9_2(conv9)
         
         conv10 = self.conv10_1(conv9)
         
-        # 残差连接
         if self.res:
             out = conv10 + x
         else:
             out = conv10
             
         return out
+
+
+def test_all_bayer_params():
+    """测试全BayerConvBlock版本的参数量"""
     
-    def get_noise_params(self, data):
-        """从数据中提取噪声参数（兼容PMN框架）"""
-        if 'noise_params' in data:
-            return data['noise_params']
+    configs = [
+        {'nf': 28, 'name': '全Bayer-28通道'},
+        {'nf': 32, 'name': '全Bayer-32通道'},
+        {'nf': 36, 'name': '全Bayer-36通道'},
+        {'nf': 40, 'name': '全Bayer-40通道'},
+    ]
+    
+    print("参数量对比:")
+    print("-" * 50)
+    
+    for config in configs:
+        args = {
+            'nframes': 1,
+            'in_nc': 4,
+            'out_nc': 4,
+            'nf': config['nf'],
+            'res': True,
+            'use_physics': True,
+            'camera_type': 'SonyA7S2'
+        }
         
-        # 尝试从ISO获取
-        if 'ISO' in data:
-            iso = data['ISO']
-            if hasattr(iso, 'item'):
-                iso = iso.item()
-            
-            # 使用PMN的噪声参数获取函数
-            try:
-                params = sample_params_max(
-                    camera_type=self.camera_type,
-                    iso=iso
-                )
-                return params
-            except:
-                return None
+        model = PBNet_AllBayer(args)
+        total_params = sum(p.numel() for p in model.parameters())
         
-        return None
+        print(f"{config['name']}: {total_params/1e6:.2f}M 参数")
+        
+        # 测试前向传播
+        x = torch.randn(1, 4, 128, 128)
+        noise_map = torch.randn(1, 1, 128, 128)
+        
+        with torch.no_grad():
+            output = model(x, noise_map)
+            print(f"  输入: {x.shape} → 输出: {output.shape}")
+    
+    print("-" * 50)
+    print("建议: 使用32通道版本，参数量约10-11M，在目标范围内")
 
-
-class PBNet_DSC(PBNet):
-    """PBNet with Dark Shading Correction - 集成暗影校正"""
-    def __init__(self, args=None):
-        super().__init__(args)
-        # 此版本假设暗影校正已在预处理中完成
-        self.name = 'PBNet_DSC'
-
-
-# 兼容性函数
-def UNetSeeInDark_Physics(args=None):
-    """创建PBNet，兼容原始UNet接口"""
-    return PBNet(args)
-
-
-# 测试函数
-def test_pbnet_pmn():
-    """测试PBNet与PMN框架的集成"""
-    import torch
-    
-    # 创建模型
-    args = {
-        'nframes': 1,
-        'in_nc': 4,
-        'out_nc': 4,
-        'nf': 32,
-        'res': True,
-        'use_physics': True,
-        'use_bayer_conv': True,
-        'camera_type': 'SonyA7S2'
-    }
-    
-    model = PBNet(args)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    
-    # 测试输入
-    batch_size = 2
-    x = torch.randn(batch_size, 4, 128, 128)  # RGGB输入
-    iso = torch.tensor([1600, 3200])
-    
-    # 前向传播
-    with torch.no_grad():
-        output = model(x, iso=iso)
-        print(f"Input shape: {x.shape}")
-        print(f"Output shape: {output.shape}")
-    
-    # 测试噪声参数传递
-    noise_params = {
-        'K': 0.5,
-        'sigGs': 0.01,
-        'sigTL': 0.02,
-        'wp': 16383,
-        'bl': 512
-    }
-    
-    with torch.no_grad():
-        output = model(x, noise_params=noise_params)
-        print("Test with noise params passed!")
-    
-    return model
 
 
 class PBNetLoss(nn.Module):
@@ -445,7 +344,73 @@ class PBNetLoss(nn.Module):
             return total_loss, {'l1': l1_loss.item(), 'physics': physics_loss.item()}
         else:
             return l1_loss, {'l1': l1_loss.item(), 'physics': 0}
+        
+# 对比不同reduction ratio的参数量影响
+def compare_reduction_ratios():
+    """对比不同reduction ratio的参数量"""
+    channels = 128
+    
+    print("Reduction Ratio对参数量的影响:")
+    print("-" * 40)
+    
+    for ratio in [4, 8, 16]:
+        mid_channels = max(channels // ratio, 8)
+        
+        # 计算参数量
+        compress_params = channels * mid_channels
+        expand_params = mid_channels * channels
+        total_params = compress_params + expand_params
+        
+        print(f"Ratio {ratio}: {channels}→{mid_channels}→{channels}")
+        print(f"  参数量: {total_params:,} ({total_params/1000:.1f}K)")
+        print(f"  相比直接连接减少: {(1 - total_params/(channels*channels))*100:.1f}%")
+        print()
+
+
+# 对比BatchNorm vs InstanceNorm
+def compare_normalization():
+    """展示BatchNorm和InstanceNorm的差异"""
+    batch_size = 4
+    channels = 64
+    height, width = 32, 32
+    
+    # 模拟不同噪声程度的输入
+    clean = torch.randn(1, channels, height, width) * 0.1
+    noisy = torch.randn(1, channels, height, width) * 0.5  
+    very_noisy = torch.randn(1, channels, height, width) * 1.0
+    extreme_noisy = torch.randn(1, channels, height, width) * 2.0
+    
+    batch_input = torch.cat([clean, noisy, very_noisy, extreme_noisy], dim=0)
+    
+    # BatchNorm vs InstanceNorm
+    bn = nn.BatchNorm2d(channels)
+    in_norm = nn.InstanceNorm2d(channels, affine=True)
+    
+    with torch.no_grad():
+        bn_output = bn(batch_input)
+        in_output = in_norm(batch_input)
+        
+        print("归一化方式对比:")
+        print("-" * 30)
+        print("输入统计 (每个样本的std):")
+        for i in range(batch_size):
+            print(f"  样本{i}: {torch.std(batch_input[i]):.3f}")
+        
+        print("\nBatchNorm输出 (强制batch内统一):")
+        for i in range(batch_size):
+            print(f"  样本{i}: {torch.std(bn_output[i]):.3f}")
+            
+        print("\nInstanceNorm输出 (保持样本独立性):")
+        for i in range(batch_size):
+            print(f"  样本{i}: {torch.std(in_output[i]):.3f}")
+
+# 兼容性函数
+def UNetSeeInDark_Physics(args=None):
+    return PBNet_AllBayer(args)
 
 
 if __name__ == '__main__':
-    test_pbnet_pmn()
+    test_all_bayer_params()
+    compare_reduction_ratios()
+    print("="*50)
+    compare_normalization()

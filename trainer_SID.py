@@ -66,7 +66,10 @@ class SID_Trainer(Base_Trainer):
                                     num_workers=self.args['num_workers'], pin_memory=False)
 
 
-        self.net = self.net.to(self.device)
+        if 'PBNet' in self.arch['name']:
+            self.loss = PBNetLoss(camera_type=self.dst.get('camera_type', 'SonyA7S2'))
+        else:
+            self.loss = Unet_Loss()
         self.loss = Unet_Loss()
         # 添加感知损失
         if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
@@ -193,9 +196,13 @@ class SID_Trainer(Base_Trainer):
                         # 检查输出格式
                         if isinstance(outputs, tuple) and len(outputs) == 4:
                             main_output, texture_mask, detail_output, denoise_output = outputs
+                            # 计算多损失
+                            loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
                         else:
+                            # PBNet
                             main_output = outputs
                             texture_mask, detail_output, denoise_output = None, None, None
+                            loss = self.loss(pred.clamp(0,1), imgs_hr)
                             
                         # 如果去噪没提前线性提亮，算loss的时候提亮上去
                         if self.dst['ori'] is True:
@@ -207,8 +214,6 @@ class SID_Trainer(Base_Trainer):
                         
                         pred = main_output
                                 
-                        # 计算多损失
-                        loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
                     else:
                         pred = self.net(imgs_lr)
                         # 极暗，乘上去
@@ -617,7 +622,6 @@ class SID_Trainer(Base_Trainer):
                     data['noise_map'] = noise_map
 
                 # 处理噪声图(如果存在)
-                noise_map = None
                 if 'noise_map' in data:
                     noise_map = tensor_dim5to4(data['noise_map']).type(torch.FloatTensor).to(self.device)
                     
@@ -756,55 +760,40 @@ class SID_Trainer(Base_Trainer):
         #         torch.cuda.set_rng_state_all(checkpoint['random_state']['cuda'])
 
     def generate_noise_map_batch(self, images, noise_params_list):
-        """为一个batch生成噪声图"""
-        noise_maps = []
+        """为一个batch生成噪声图，每个样本独立归一化"""
+        normalized_maps = []
         
-        for i, (img, params) in enumerate(zip(images, noise_params_list)):
-            # 使用实际的噪声参数生成噪声图
+        for img, params in zip(images, noise_params_list):
+            # 生成单个噪声图
             noise_map = generate_noise_map(
                 image=img.cpu().numpy(),
                 noise_params=params
             )
-            noise_maps.append(noise_map)
-
-        # 添加归一化处理
-        if noise_maps is not None:
-            # 判断是否为PyTorch张量
-            is_tensor = torch.is_tensor(noise_maps)
             
-            # 遍历每个裁剪样本进行归一化
-            # [crop_per_image, C, H, W]
-            normalized_maps = []
-            for single_map in noise_maps:
+            if noise_map is not None:
+                # 转换为numpy（如果不是的话）
+                if torch.is_tensor(noise_map):
+                    noise_map = noise_map.cpu().numpy()
                 
-                if is_tensor:
-                    map_min = torch.min(single_map)
-                    map_max = torch.max(single_map)
-                    
-                    # 避免除零错误
-                    if map_max - map_min > 1e-6:
-                        normalized = (single_map - map_min) / (map_max - map_min)
-                    else:
-                        normalized = torch.zeros_like(single_map) + 0.5
+                # 对单个样本进行归一化
+                map_min = np.min(noise_map)
+                map_max = np.max(noise_map)
+                
+                if map_max - map_min > 1e-6:
+                    normalized = (noise_map - map_min) / (map_max - map_min)
                 else:
-                    map_min = np.min(single_map)
-                    map_max = np.max(single_map)
+                    normalized = np.ones_like(noise_map) * 0.5
                     
-                    # 避免除零错误
-                    if map_max - map_min > 1e-6:
-                        normalized = (single_map - map_min) / (map_max - map_min)
-                    else:
-                        normalized = np.zeros_like(single_map) + 0.5
-                
                 normalized_maps.append(normalized)
-            
-            # 重新组合批次
-            if is_tensor:
-                noise_maps = torch.stack(normalized_maps, dim=0)
             else:
-                noise_maps = np.stack(normalized_maps, axis=0)
+                print("Warning: No valid noise parameters provided, cannot generate noise map.")
         
-        return np.stack(noise_maps, axis=0)
+        if normalized_maps:
+            # Stack成batch并转换为tensor
+            batch_tensor = torch.from_numpy(np.stack(normalized_maps, axis=0)).float()
+            return batch_tensor.to(images.device)
+        
+        return None
 
 def MultiProcessPlot(imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch, 
                     raw_metrics, infos, model_name, sample_dir):
