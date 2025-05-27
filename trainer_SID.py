@@ -588,9 +588,26 @@ class SID_Trainer(Base_Trainer):
                             'bl': p['bl']
                         })
                     else:
-                        # 原始数据：根据ISO估算参数
-                        iso = data['ISO'][i//self.dst['crop_per_image']].item()
-                        estimated_params = get_camera_noisy_params_max(f'{self.dst["camera_type"]}_{iso}')
+                        # 原始数据：使用get_camera_noisy_params获取完整参数
+                        branch = '_highISO' if iso > 1600 else '_lowISO'
+                        base_params = get_camera_noisy_params(f'{self.dst["camera_type"]}{branch}')
+                        
+                        # 根据ISO计算具体的K值（与noise_map.py保持一致）
+                        log_ratio = math.log(base_params['Kmax']/base_params['Kmin']) / math.log(409600/100)
+                        K = base_params['Kmin'] * (iso / 100) ** log_ratio
+                        
+                        # 计算sigma_read
+                        sigma_read = base_params['sigGsk'] * math.log(K) + base_params['sigGsb']
+                        sigma_read = math.exp(sigma_read)
+                        
+                        estimated_params = {
+                            'K': K,
+                            'Kmin': base_params['Kmin'],
+                            'Kmax': base_params['Kmax'], 
+                            'sigGs': sigma_read,
+                            'wp': base_params['wp'],
+                            'bl': base_params['bl']
+                        }
                         noise_params.append(estimated_params)
                 data['noise_parms'] = noise_params
 

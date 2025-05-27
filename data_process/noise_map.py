@@ -27,52 +27,6 @@ def generate_noise_map(image, noise_params=None, camera_params=None, iso=None, c
         K = noise_params['K']  # 直接使用SNA_torch的参数结构
         sigma_r = noise_params['sigGs']
 
-    # Method 2: Calculate K from ISO values (fallback method)
-    elif iso is not None:
-        if camera_params is not None and camera_name is not None and camera_name in camera_params:
-            # Get K range from camera parameters
-            K_min = camera_params[camera_name]['Kmin']
-            K_max = camera_params[camera_name]['Kmax']
-
-            # Get ISO range (typical values)
-            ISO_min = 100
-            ISO_max = 409600  # High value for Sony A7S2
-
-            # Logarithmic mapping from ISO to K
-            if is_tensor:
-                iso_tensor = iso.to(device) if torch.is_tensor(iso) else torch.tensor(iso).to(device)
-                log_ratio = math.log(K_max/K_min) / math.log(ISO_max/ISO_min)
-                K = K_min * torch.pow(iso_tensor / ISO_min, log_ratio)
-                sigma_r = 0.01 * torch.sqrt(K)
-            else:
-                # Numpy implementation
-                log_ratio = math.log(K_max/K_min) / math.log(ISO_max/ISO_min)
-                K = K_min * np.power(iso / ISO_min, log_ratio)
-                sigma_r = 0.01 * np.sqrt(K)
-        else:
-            # Simplified estimation without camera parameters
-            if is_tensor:
-                iso_tensor = iso.to(device) if torch.is_tensor(iso) else torch.tensor(iso).to(device)
-                K = iso_tensor / 100.0
-                sigma_r = 0.01 * torch.sqrt(K)
-            else:
-                K = iso / 100.0
-                sigma_r = 0.01 * np.sqrt(K)
-
-        # Reshape K and sigma_r for proper broadcasting
-        if is_tensor:
-            if K.dim() == 0:
-                K = K.view(1, 1, 1, 1)
-                sigma_r = sigma_r.view(1, 1, 1, 1)
-            else:
-                K = K.view(-1, 1, 1, 1)
-                sigma_r = sigma_r.view(-1, 1, 1, 1)
-        else:
-            # For numpy, reshape if needed
-            if np.isscalar(K):
-                K = np.array(K)
-                sigma_r = np.array(sigma_r)
-
     # If no valid parameters are available, return None
     else:
         return None
