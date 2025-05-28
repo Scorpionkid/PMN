@@ -13,6 +13,7 @@ class SID_Trainer(Base_Trainer):
         super().__init__()
         # model
         self.net = globals()[self.arch['name']](self.arch)
+        self.net = self.net.to(self.device)
         
         # ===== 检查配置中是否启用深度可分离卷积 =====
         if self.arch.get('use_depthwise_separable', False):
@@ -65,18 +66,17 @@ class SID_Trainer(Base_Trainer):
             self.dataloader_eval = DataLoader(self.dst_eval, batch_size=1, shuffle=False, 
                                     num_workers=self.args['num_workers'], pin_memory=False)
 
-
         if 'PBNet' in self.arch['name']:
             self.loss = PBNetLoss(camera_type=self.dst.get('camera_type', 'SonyA7S2'))
         else:
             self.loss = Unet_Loss()
-        self.loss = Unet_Loss()
-        # 添加感知损失
-        if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
-            self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+
+        # # 添加感知损失
+        # if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
+        #     self.perceptual_loss = VGGPerceptualLoss().to(self.device)
         
-        # 添加梯度损失
-        if 'gradient' in self.args['loss'] and self.args['loss']['gradient']:
+        # # 添加梯度损失
+        # if 'gradient' in self.args['loss'] and self.args['loss']['gradient']:
             self.gradient_loss = GradientLoss().to(self.device)
         self.corrector = IlluminanceCorrect()
         torch.backends.cudnn.benchmark = True
@@ -196,24 +196,22 @@ class SID_Trainer(Base_Trainer):
                         # 检查输出格式
                         if isinstance(outputs, tuple) and len(outputs) == 4:
                             main_output, texture_mask, detail_output, denoise_output = outputs
+                            # 如果去噪没提前线性提亮，算loss的时候提亮上去
+                            if self.dst['ori'] is True:
+                                main_output = main_output * ratio
+                                if detail_output is not None:
+                                    detail_output = detail_output * ratio
+                                if denoise_output is not None:
+                                    denoise_output = denoise_output * ratio
                             # 计算多损失
                             loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
                         else:
                             # PBNet
-                            main_output = outputs
-                            texture_mask, detail_output, denoise_output = None, None, None
-                            loss = self.loss(pred.clamp(0,1), imgs_hr)
+                            pred = outputs
+                            if self.dst['ori'] is True:
+                                pred = pred * ratio
+                            loss, loss_values = self.loss(pred.clamp(0,1), imgs_hr)
                             
-                        # 如果去噪没提前线性提亮，算loss的时候提亮上去
-                        if self.dst['ori'] is True:
-                            main_output = main_output * ratio
-                            if detail_output is not None:
-                                detail_output = detail_output * ratio
-                            if denoise_output is not None:
-                                denoise_output = denoise_output * ratio
-                        
-                        pred = main_output
-                                
                     else:
                         pred = self.net(imgs_lr)
                         # 极暗，乘上去
@@ -579,9 +577,9 @@ class SID_Trainer(Base_Trainer):
                     if data['black_lr'][0]: aug_wb += 1
                     dgain = data['ratio'][i]
                     imgs_lr[i] = imgs_lr[i] if self.dst['ori'] else imgs_lr[i] * dgain
+                    iso = data['ISO'][i//self.dst['crop_per_image']].item()
                     if np.abs(aug_wb).max() != 0:
                         data['wb'][i] *= (1+aug_wb[1]) / (1+aug_wb)
-                        iso = data['ISO'][i//self.dst['crop_per_image']].item()
                         dn, dy, p = SNA_torch(imgs_hr[i], aug_wb, iso=iso, ratio=dgain, black_lr=data['black_lr'][0],
                             camera_type=self.dst['camera_type'], ori=self.dst['ori'])
                         imgs_lr[i] = imgs_lr[i] + dn 
@@ -598,8 +596,10 @@ class SID_Trainer(Base_Trainer):
                         base_params = get_camera_noisy_params(f'{self.dst["camera_type"]}{branch}')
                         
                         # 根据ISO计算具体的K值（与noise_map.py保持一致）
-                        log_ratio = math.log(base_params['Kmax']/base_params['Kmin']) / math.log(409600/100)
-                        K = base_params['Kmin'] * (iso / 100) ** log_ratio
+                        Kmax = math.exp(base_params['Kmax'])
+                        Kmin = math.exp(base_params['Kmin'])
+                        log_ratio = math.log(Kmax/Kmin) / math.log(409600/100)
+                        K = Kmin * (iso / 100) ** log_ratio
                         
                         # 计算sigma_read
                         sigma_read = base_params['sigGsk'] * math.log(K) + base_params['sigGsb']
@@ -620,10 +620,6 @@ class SID_Trainer(Base_Trainer):
                 if self.arch.get('use_noise_map', False):
                     noise_map = self.generate_noise_map_batch(imgs_lr, noise_params)
                     data['noise_map'] = noise_map
-
-                # 处理噪声图(如果存在)
-                if 'noise_map' in data:
-                    noise_map = tensor_dim5to4(data['noise_map']).type(torch.FloatTensor).to(self.device)
                     
             elif self.args['dst_train']['dataset'] == 'Raw_Dataset':
                 data['ratio'] = torch.ones(b, device=self.device)
@@ -641,7 +637,35 @@ class SID_Trainer(Base_Trainer):
                     imgs_lr[i] = generate_noisy_torch(imgs_lr[i], param=noise_param,
                                 noise_code=self.dst['noise_code'], ori=self.dst['ori'], clip=self.dst['clip'])
         else: # mode == 'eval'
-            pass
+            if self.arch.get('use_noise_map', False):
+                # 获取ISO信息
+                iso = data['ISO'] if 'ISO' in data else None
+                if iso is not None:
+                    branch = '_highISO' if iso > 1600 else '_lowISO'
+                    base_params = get_camera_noisy_params(f'{self.dst["camera_type"]}{branch}')
+                    
+                    # 根据ISO计算具体的K值（与noise_map.py保持一致）
+                    Kmax = math.exp(base_params['Kmax'])
+                    Kmin = math.exp(base_params['Kmin'])
+                    log_ratio = math.log(Kmax/Kmin) / math.log(409600/100)
+                    K = Kmin * (iso / 100) ** log_ratio
+                    
+                    # 计算sigma_read
+                    sigma_read = base_params['sigGsk'] * math.log(K) + base_params['sigGsb']
+                    sigma_read = math.exp(sigma_read)
+                    
+                    noise_params = {
+                        'K': K,
+                        'Kmin': base_params['Kmin'],
+                        'Kmax': base_params['Kmax'], 
+                        'sigGs': sigma_read,
+                        'wp': base_params['wp'],
+                        'bl': base_params['bl']
+                    }
+
+                    noise_map = generate_noise_map(imgs_lr.cpu().numpy(), noise_params)
+                    noise_map = self.standardized_noise_map(noise_map)
+                    noise_map = torch.from_numpy(noise_map).float().to(imgs_lr.device)
         
         ratio = data['ratio'].type(torch.FloatTensor).to(self.device)
         ratio = ratio.view(-1,1,1,1)
@@ -770,20 +794,8 @@ class SID_Trainer(Base_Trainer):
                 noise_params=params
             )
             
-            if noise_map is not None:
-                # 转换为numpy（如果不是的话）
-                if torch.is_tensor(noise_map):
-                    noise_map = noise_map.cpu().numpy()
-                
-                # 对单个样本进行归一化
-                map_min = np.min(noise_map)
-                map_max = np.max(noise_map)
-                
-                if map_max - map_min > 1e-6:
-                    normalized = (noise_map - map_min) / (map_max - map_min)
-                else:
-                    normalized = np.ones_like(noise_map) * 0.5
-                    
+            normalized = self.standardized_noise_map(noise_map)
+            if normalized is not None:        
                 normalized_maps.append(normalized)
             else:
                 print("Warning: No valid noise parameters provided, cannot generate noise map.")
@@ -794,6 +806,33 @@ class SID_Trainer(Base_Trainer):
             return batch_tensor.to(images.device)
         
         return None
+    
+    def standardized_noise_map(self, noise_map):
+        if noise_map is not None:
+            # 转换为numpy（如果不是的话）
+            if torch.is_tensor(noise_map):
+                noise_map = noise_map.cpu().numpy()
+            
+            if noise_map.ndim == 3:
+                noise_map = np.mean(noise_map, axis=0, keepdims=True)
+            else:
+                noise_map = np.mean(noise_map, axis=1, keepdims=True)
+
+            # 对单个样本进行归一化
+            map_min = np.min(noise_map)
+            map_max = np.max(noise_map)
+            
+            if map_max - map_min > 1e-6:
+                normalized = (noise_map - map_min) / (map_max - map_min)
+            else:
+                print("noise_map map_max - map_min < 1e-6:")
+            
+            return normalized
+        else:
+            print("Standardize: noise_map is None")
+            return None
+
+
 
 def MultiProcessPlot(imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch, 
                     raw_metrics, infos, model_name, sample_dir):

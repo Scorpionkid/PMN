@@ -22,7 +22,7 @@ def generate_noise_map(image, noise_params=None, camera_params=None, iso=None, c
     device = image.device if is_tensor else None
     
     # Method 1: Use noise parameters directly from noise generator (preferred method)
-    if noise_params is not None and 'shot' in noise_params:
+    if noise_params is not None and 'K' in noise_params:
         # Get noise parameters
         K = noise_params['K']  # 直接使用SNA_torch的参数结构
         sigma_r = noise_params['sigGs']

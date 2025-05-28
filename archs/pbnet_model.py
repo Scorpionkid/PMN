@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from .modules import *
 
 
 class LightweightPhysicsBlock(nn.Module):
@@ -118,6 +117,182 @@ class BayerConv(nn.Module):
         # 从这里开始，输出的特征不再有严格的RGGB语义
         # 而是融合了颜色信息的抽象特征表示
         return output
+    
+class TrueBayerAwareConv(nn.Module):
+    """真正的Bayer-aware卷积 - 理解RGGB的空间排列和邻接关系"""
+    def __init__(self, in_channels=4, out_channels=32, kernel_size=3):
+        super().__init__()
+        assert in_channels == 4, "BayerAwareConv只处理RGGB输入(4通道)"
+        
+        # 通道顺序：[R, G1, B, G2] 对应 [左上, 右上, 右下, 左下]
+        self.out_channels = out_channels
+        mid_channels = out_channels // 2  # 中间特征通道数
+        
+        # ========== 1. 空间位置编码 ==========
+        # 为每个Bayer位置创建可学习的位置嵌入
+        self.position_embed = nn.Parameter(torch.randn(1, 4, 1, 1))
+        
+        # ========== 2. 邻接关系建模 ==========
+        # 水平邻接: R-G1 (左上-右上)
+        self.conv_h_rg1 = nn.Conv2d(2, mid_channels, kernel_size, padding=kernel_size//2)
+        
+        # 水平邻接: G2-B (左下-右下)  
+        self.conv_h_g2b = nn.Conv2d(2, mid_channels, kernel_size, padding=kernel_size//2)
+        
+        # 垂直邻接: R-G2 (左上-左下)
+        self.conv_v_rg2 = nn.Conv2d(2, mid_channels, kernel_size, padding=kernel_size//2)
+        
+        # 垂直邻接: G1-B (右上-右下)
+        self.conv_v_g1b = nn.Conv2d(2, mid_channels, kernel_size, padding=kernel_size//2)
+        
+        # ========== 3. 对角关系建模 ==========
+        # 主对角: R-B (左上-右下)
+        self.conv_diag_rb = nn.Conv2d(2, mid_channels//2, kernel_size, padding=kernel_size//2)
+        
+        # 副对角: G1-G2 (右上-左下) - 两个绿色通道的关系很重要
+        self.conv_diag_g1g2 = nn.Conv2d(2, mid_channels//2, kernel_size, padding=kernel_size//2)
+        
+        # ========== 4. 绿色通道特殊处理 ==========
+        # 绿色通道占50%，需要特殊关注
+        self.green_fusion = nn.Conv2d(2, mid_channels, kernel_size, padding=kernel_size//2)
+        
+        # ========== 5. 颜色通道独立处理 ==========
+        # 每个颜色通道的专属处理器
+        self.color_specific = nn.ModuleDict({
+            'R': nn.Conv2d(1, mid_channels//4, kernel_size, padding=kernel_size//2),
+            'G1': nn.Conv2d(1, mid_channels//4, kernel_size, padding=kernel_size//2),
+            'G2': nn.Conv2d(1, mid_channels//4, kernel_size, padding=kernel_size//2),
+            'B': nn.Conv2d(1, mid_channels//4, kernel_size, padding=kernel_size//2)
+        })
+        
+        # ========== 6. 特征融合和输出 ==========
+        # 计算总的中间通道数
+        total_mid = (
+            4 * mid_channels +      # 邻接关系 (4个)
+            mid_channels +          # 对角关系 (2个 × mid_channels//2)
+            mid_channels +          # 绿色融合
+            mid_channels            # 颜色特定 (4个 × mid_channels//4)
+        )
+        
+        self.feature_fusion = nn.Sequential(
+            nn.Conv2d(total_mid, out_channels, 1),
+            nn.InstanceNorm2d(out_channels, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.InstanceNorm2d(out_channels, affine=True),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # 可学习的通道重要性权重
+        self.channel_importance = nn.Parameter(torch.tensor([1.0, 0.9, 1.0, 0.9]))
+        
+    def forward(self, x):
+        """
+        x: [B, 4, H, W] - pack后的RGGB数据
+        通道顺序: [R, G1, B, G2]
+        空间对应: [左上, 右上, 右下, 左下]
+        """
+        B, C, H, W = x.shape
+        
+        # 加入位置编码
+        x_pos = x + self.position_embed
+        
+        # 提取各个通道
+        R = x_pos[:, 0:1]   # 左上
+        G1 = x_pos[:, 1:2]  # 右上  
+        B = x_pos[:, 2:3]   # 右下
+        G2 = x_pos[:, 3:4]  # 左下
+        
+        # 应用通道重要性权重
+        R = R * self.channel_importance[0]
+        G1 = G1 * self.channel_importance[1]
+        B = B * self.channel_importance[2]
+        G2 = G2 * self.channel_importance[3]
+        
+        features = []
+        
+        # ========== 邻接关系特征 ==========
+        # 水平邻接
+        h_rg1 = self.conv_h_rg1(torch.cat([R, G1], dim=1))
+        h_g2b = self.conv_h_g2b(torch.cat([G2, B], dim=1))
+        features.extend([h_rg1, h_g2b])
+        
+        # 垂直邻接
+        v_rg2 = self.conv_v_rg2(torch.cat([R, G2], dim=1))
+        v_g1b = self.conv_v_g1b(torch.cat([G1, B], dim=1))
+        features.extend([v_rg2, v_g1b])
+        
+        # ========== 对角关系特征 ==========
+        diag_rb = self.conv_diag_rb(torch.cat([R, B], dim=1))
+        diag_g1g2 = self.conv_diag_g1g2(torch.cat([G1, G2], dim=1))
+        features.extend([diag_rb, diag_g1g2])
+        
+        # ========== 绿色通道特殊处理 ==========
+        green_feat = self.green_fusion(torch.cat([G1, G2], dim=1))
+        features.append(green_feat)
+        
+        # ========== 颜色通道独立特征 ==========
+        color_feats = []
+        color_feats.append(self.color_specific['R'](R))
+        color_feats.append(self.color_specific['G1'](G1))
+        color_feats.append(self.color_specific['G2'](G2))
+        color_feats.append(self.color_specific['B'](B))
+        features.extend(color_feats)
+        
+        # ========== 特征融合 ==========
+        all_features = torch.cat(features, dim=1)
+        output = self.feature_fusion(all_features)
+        
+        return output
+
+
+class BayerPositionalConv(nn.Module):
+    """带Bayer位置感知的卷积 - 更轻量级的实现"""
+    def __init__(self, in_channels=4, out_channels=32, kernel_size=3):
+        super().__init__()
+        assert in_channels == 4
+        
+        # 为保持轻量级，使用分组卷积
+        self.groups = 4
+        inter_channels = out_channels
+        
+        # Bayer感知的分组卷积 - 每组处理特定的空间关系
+        self.grouped_conv = nn.Conv2d(
+            in_channels, inter_channels, 
+            kernel_size, padding=kernel_size//2, 
+            groups=self.groups
+        )
+        
+        # 跨通道交互 - 建模Bayer模式关系
+        self.pattern_aware = nn.Sequential(
+            # 深度可分离卷积风格
+            nn.Conv2d(inter_channels, inter_channels, 3, padding=1, groups=inter_channels),
+            nn.Conv2d(inter_channels, out_channels, 1),
+            nn.InstanceNorm2d(out_channels, affine=True),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Bayer模式的学习权重矩阵 - 编码空间关系
+        self.bayer_weights = nn.Parameter(torch.tensor([
+            [1.0, 0.5, 0.3, 0.5],  # R与其他通道的关系权重
+            [0.5, 1.0, 0.5, 0.7],  # G1与其他通道的关系权重  
+            [0.3, 0.5, 1.0, 0.5],  # B与其他通道的关系权重
+            [0.5, 0.7, 0.5, 1.0]   # G2与其他通道的关系权重
+        ]))
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # 应用Bayer权重矩阵 - 调制输入
+        x_weighted = torch.einsum('bcxy,cd->bdxy', x, self.bayer_weights)
+        
+        # 分组卷积处理
+        feat = self.grouped_conv(x_weighted)
+        
+        # 跨通道交互和输出
+        output = self.pattern_aware(feat)
+        
+        return output
 
 
 class PBNet(nn.Module):
@@ -145,7 +320,7 @@ class PBNet(nn.Module):
         self.camera_type = self.args.get('camera_type', 'SonyA7S2')
         
         # ============ Bayer-aware入口层 ============
-        self.bayer_entry = BayerConv(in_nc * nframes, nf, kernel_size=3)
+        self.bayer_entry = BayerPositionalConv(in_nc * nframes, nf, kernel_size=3)
         
         # ============ 标准CNN编码器 ============
         self.conv1_2 = nn.Conv2d(nf, nf, 3, padding=1)
@@ -207,7 +382,7 @@ class PBNet(nn.Module):
         # 从这里开始，特征不再有严格的RGGB语义
         
         # 继续第一层处理
-        conv1 = self.relu(self.norm1_2(self.conv1_2(conv1)))
+        conv1 = self.relu((self.conv1_2(conv1)))
         
         # 应用物理约束
         if self.use_physics and noise_map is not None:
