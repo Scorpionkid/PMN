@@ -257,10 +257,11 @@ class BayerPositionalConv(nn.Module):
         inter_channels = out_channels
         
         # Bayer感知的分组卷积 - 每组处理特定的空间关系
-        self.grouped_conv = nn.Conv2d(
-            in_channels, inter_channels, 
-            kernel_size, padding=kernel_size//2, 
-            groups=self.groups
+        self.grouped_conv = nn.Sequential(
+            nn.Conv2d(in_channels, inter_channels, 
+                     kernel_size, padding=kernel_size//2, groups=self.groups),
+            nn.InstanceNorm2d(inter_channels, affine=True),  # 添加归一化
+            nn.LeakyReLU(0.2, inplace=True)  # 添加激活函数
         )
         
         # 跨通道交互 - 建模Bayer模式关系
@@ -274,10 +275,10 @@ class BayerPositionalConv(nn.Module):
         
         # Bayer模式的学习权重矩阵 - 编码空间关系
         self.bayer_weights = nn.Parameter(torch.tensor([
-            [1.0, 0.5, 0.3, 0.5],  # R与其他通道的关系权重
-            [0.5, 1.0, 0.5, 0.7],  # G1与其他通道的关系权重  
-            [0.3, 0.5, 1.0, 0.5],  # B与其他通道的关系权重
-            [0.5, 0.7, 0.5, 1.0]   # G2与其他通道的关系权重
+            [0.5, 0.25, 0.15, 0.25],  # 权重减半
+            [0.25, 0.5, 0.25, 0.35],
+            [0.15, 0.25, 0.5, 0.25],
+            [0.25, 0.35, 0.25, 0.5]
         ]))
         
     def forward(self, x):
@@ -291,6 +292,8 @@ class BayerPositionalConv(nn.Module):
         
         # 跨通道交互和输出
         output = self.pattern_aware(feat)
+
+        # output = torch.tanh(output)
         
         return output
 
@@ -382,7 +385,7 @@ class PBNet(nn.Module):
         # 从这里开始，特征不再有严格的RGGB语义
         
         # 继续第一层处理
-        conv1 = self.relu((self.conv1_2(conv1)))
+        conv1 = self.relu(self.norm1_2(self.conv1_2(conv1)))
         
         # 应用物理约束
         if self.use_physics and noise_map is not None:
