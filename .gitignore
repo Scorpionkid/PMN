@@ -8,3 +8,4 @@ logs/*
 metrics/*
 *.log
 *.info
+.history/*

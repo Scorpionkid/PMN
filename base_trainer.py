@@ -55,6 +55,7 @@ class Base_Trainer():
         self.dst = self.args['dst']
         self.hyper = self.args['hyper']
         self.arch = self.args['arch']
+        self.loss = self.args['loss']
         self.arch_isp = self.args['arch_isp'] if 'arch_isp' in self.args else None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.hostname = socket.gethostname()

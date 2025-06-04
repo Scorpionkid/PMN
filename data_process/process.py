@@ -711,7 +711,7 @@ def SNA_torch(gt, aug_wb, camera_type='IMX686', ratio=1, black_lr=False, ori=Tru
     if ori is False:
         dn *= ratio
     
-    return dn, dy
+    return dn, dy, p 
 
 # @ fn_timer
 def generate_noisy_obs(y, camera_type=None, wp=16383, noise_code='p', param=None, MultiFrameMean=1, ori=False, clip=False):

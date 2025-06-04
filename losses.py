@@ -115,7 +115,8 @@ class Unet_Loss(nn.Module):
         # loss_recon = F.l1_loss(low, high)
         # loss_grad = self.grad_loss(low, high)
         # loss_enhance = self.mutual_consistency(low, high, hook)
-        return loss
+        loss_values = {'l1loss': loss.item()}  # , 'grad_loss': loss_grad.item()}
+        return loss, loss_values
 
 class Unet_dpsv_Loss(Unet_Loss):
     def __init__(self, charbonnier=False):

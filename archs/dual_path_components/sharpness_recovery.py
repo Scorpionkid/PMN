@@ -125,20 +125,22 @@ class SharpnessRecovery(nn.Module):
         if self.use_texture_mask and texture_mask is not None:
             boost_factor = torch.clamp(self.texture_boost, 0.1, 0.9)
 
+            # scheme1:
+            # 使用网络增强纹理掩码的表现力
+            enhanced_texture = self.texture_enhance(texture_mask)
+            base_sharpness = (texture_mask + enhanced_texture) / 2.0
+            boosted_sharpness = base_sharpness * boost_factor
 
             if self.use_noise_map and noise_map is not None:
                 # 噪声调制因子：0.3到1.0范围，不会完全消除锐化
                 noise_factor = 0.3 + 0.7 * torch.exp(-4.0 * noise_map)
 
-                # scheme1:
-                # 使用网络增强纹理掩码的表现力
-                enhanced_texture = self.texture_enhance(texture_mask)
-                base_sharpness = (texture_mask + enhanced_texture) / 2.0
-                boosted_sharpness = base_sharpness * boost_factor
                 sharp_mask = boosted_sharpness * noise_factor
 
                 # scheme2:
                 # sharp_mask = texture_mask * boost_factor * noise_factor
+            else:
+                sharp_mask = boosted_sharpness
 
             sharp_mask = torch.clamp(sharp_mask, 0.05, 0.95)
 

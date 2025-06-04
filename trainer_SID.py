@@ -67,17 +67,18 @@ class SID_Trainer(Base_Trainer):
                                     num_workers=self.args['num_workers'], pin_memory=False)
 
         if 'PBNet' in self.arch['name']:
-            self.loss = PBNetLoss(camera_type=self.dst.get('camera_type', 'SonyA7S2'))
+            self.PBNetloss = PBNetLoss(camera_type=self.dst.get('camera_type', 'SonyA7S2'))
         else:
-            self.loss = Unet_Loss()
+            self.l1loss = Unet_Loss()
 
-        # # 添加感知损失
-        # if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
-        #     self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+        # 添加感知损失
+        if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
+            self.perceptual_loss = VGGPerceptualLoss().to(self.device)
         
-        # # 添加梯度损失
-        # if 'gradient' in self.args['loss'] and self.args['loss']['gradient']:
+        # 添加梯度损失
+        if 'gradient' in self.args['loss'] and self.args['loss']['gradient']:
             self.gradient_loss = GradientLoss().to(self.device)
+
         self.corrector = IlluminanceCorrect()
         torch.backends.cudnn.benchmark = True
         # model log
@@ -191,33 +192,54 @@ class SID_Trainer(Base_Trainer):
                     
                     # 训练
                     self.optimizer.zero_grad()
-                    if noise_map is not None:
-                        outputs = self.net(imgs_lr, noise_map)
-                        # 检查输出格式
-                        if isinstance(outputs, tuple) and len(outputs) == 4:
-                            main_output, texture_mask, detail_output, denoise_output = outputs
-                            # 如果去噪没提前线性提亮，算loss的时候提亮上去
-                            if self.dst['ori'] is True:
-                                main_output = main_output * ratio
-                                if detail_output is not None:
-                                    detail_output = detail_output * ratio
-                                if denoise_output is not None:
-                                    denoise_output = denoise_output * ratio
-                            # 计算多损失
-                            loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
+                    if 'DPNet' in self.arch['name']:
+                        if noise_map is not None:
+                            outputs = self.net(imgs_lr, noise_map)
+                            # 检查输出格式
+                            if isinstance(outputs, tuple) and len(outputs) == 4:
+                                main_output, texture_mask, detail_output, denoise_output = outputs
+                                # 如果去噪没提前线性提亮，算loss的时候提亮上去
+                                if self.dst['ori'] is True:
+                                    main_output = main_output * ratio
+                                    if detail_output is not None:
+                                        detail_output = detail_output * ratio
+                                    if denoise_output is not None:
+                                        denoise_output = denoise_output * ratio
+                                pred = main_output
+                                # 计算多损失
+                                loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
                         else:
-                            # PBNet
-                            pred = outputs
-                            if self.dst['ori'] is True:
-                                pred = pred * ratio
-                            loss, loss_values = self.loss(pred.clamp(0,1), imgs_hr)
+                            outputs = self.net(imgs_lr)
+                            if isinstance(outputs, tuple) and len(outputs) == 4:
+                                main_output, texture_mask, detail_output, denoise_output = outputs
+                                # 如果去噪没提前线性提亮，算loss的时候提亮上去
+                                if self.dst['ori'] is True:
+                                    main_output = main_output * ratio
+                                    if detail_output is not None:
+                                        detail_output = detail_output * ratio
+                                    if denoise_output is not None:
+                                        denoise_output = denoise_output * ratio
+                                pred = main_output
+                                # 计算多损失
+                                if self.loss['multiloss']:
+                                    loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
+                                else:
+                                    loss, loss_values = self.l1loss(pred.clamp(0,1), imgs_hr)
+
+                    elif 'PBNet' in self.arch['name']:
+                        # PBNet
+                        pred = outputs
+                        if self.dst['ori'] is True:
+                            pred = pred * ratio
+                        loss, loss_values = self.PBNetloss(pred.clamp(0,1), imgs_hr)
                             
                     else:
                         pred = self.net(imgs_lr)
                         # 极暗，乘上去
                         if self.dst['ori'] is True:
                             pred = pred * ratio
-                        loss = self.loss(pred.clamp(0,1), imgs_hr)
+                        loss, loss_values = self.l1loss(pred.clamp(0,1), imgs_hr)
+
                     runtime['net'] += timestamp(time_points, 3)
                     loss.backward()
                     self.optimizer.step()
@@ -237,7 +259,7 @@ class SID_Trainer(Base_Trainer):
                         self.train_psnr.update(psnr.item())
 
                     # 格式化损失值用于显示
-                    # loss_str = ' '.join([f"{k}:{v:.4f}" for k, v in loss_values.items()])
+                    loss_str = ' '.join([f"{k}:{v:.4f}" for k, v in loss_values.items()])
                     
                     runtime['total'] = runtime['preprocess']+runtime['dataloader']+runtime['net']+runtime['bp']
                     t.set_description(f'Epoch {epoch}')
@@ -246,7 +268,7 @@ class SID_Trainer(Base_Trainer):
                                     # 'process':f"{100*runtime['preprocess']/runtime['total']:.1f}%",
                                     # 'net':f"{100*runtime['net']/runtime['total']:.1f}%",
                                     # 'bp':f"{100*runtime['bp']/runtime['total']:.1f}%",
-                                    # 'loss': loss_str
+                                    'loss': loss_str
                                     })
                     t.update(1)
                     time_points[0] = time.time()
@@ -562,7 +584,7 @@ class SID_Trainer(Base_Trainer):
         # self.use_gpu = True
         dst = self.dst_train if mode=='train' else self.dst_eval
 
-
+        noise_map = None
         if self.use_gpu and mode=='train' and preprocess:
             b = imgs_lr.shape[0]
             if self.args['dst_train']['dataset'] == 'Mix_Dataset':
@@ -683,7 +705,7 @@ class SID_Trainer(Base_Trainer):
         total_loss = 0
         
         # 主输出损失 - 使用普通的L1损失
-        main_loss = self.loss(main_output, gt)
+        main_loss = self.l1loss(main_output, gt)
         total_loss += main_loss
         
         # 记录详细损失值用于日志（可选）
@@ -705,7 +727,7 @@ class SID_Trainer(Base_Trainer):
         
         # 降噪路径中间监督 - 使用L1损失
         if denoise_output is not None:
-            denoise_loss = self.loss(denoise_output, gt)
+            denoise_loss = self.l1loss(denoise_output, gt)
             total_loss += denoise_loss * 0.5  # 权重可调
             loss_values['denoise_loss'] = denoise_loss.item()
         
