@@ -120,6 +120,58 @@ class SID_Trainer(Base_Trainer):
         else:
             log(f'Initializing {self.arch["name"]}...')
             # initialize_weights(self.net)
+            
+        resume_epoch = self.hyper.get('resume_from_epoch', 0)
+        
+        if resume_epoch > 0 or self.hyper['last_epoch'] > 0:  
+            try:
+                # 优先尝试加载断点
+                if resume_epoch > 0:
+                    # 使用resume_from_epoch指定的模型
+                    model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
+                    if not os.path.exists(model_path):
+                        model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
+                        log(f"未找到last_model，使用best_model")
+                else:
+                    # 原来的逻辑，使用last_epoch
+                    model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
+                    if not os.path.exists(model_path):
+                        model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
+                    
+                checkpoint = torch.load(model_path, map_location=self.device)
+                
+                # 检查是否是完整的训练状态
+                if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
+                    # 加载完整训练状态
+                    self.load_checkpoint(checkpoint)
+                    
+                    # ✅ 关键修改：处理resume_from_epoch的情况
+                    if resume_epoch > 0:
+                        log(f"从resume_from_epoch={resume_epoch}恢复训练，保持原有学习率周期")
+                        self.current_epoch = resume_epoch
+                        # 验证checkpoint的epoch是否匹配
+                        if checkpoint['epoch'] != resume_epoch:
+                            log(f"警告: checkpoint中的epoch为{checkpoint['epoch']}，但resume_from_epoch为{resume_epoch}")
+                            log(f"将从epoch {resume_epoch}继续训练")
+                    else:
+                        # 原来的逻辑
+                        log(f"从epoch {checkpoint['epoch']} 恢复训练状态")
+                        if checkpoint['epoch'] != self.hyper['last_epoch']:
+                            log(f"注意: YML中的last_epoch为{self.hyper['last_epoch']}，已更新为checkpoint中的{checkpoint['epoch']}")
+                            self.current_epoch = checkpoint['epoch']
+                else:
+                    # 仅加载模型权重(向后兼容)
+                    self.net = load_weights(self.net, checkpoint, multi_gpu=self.multi_gpu, by_name=True)
+                    if resume_epoch > 0:
+                        self.current_epoch = resume_epoch
+                        log(f"已加载模型权重，从epoch {resume_epoch}开始训练")
+                    else:
+                        log(f"已加载模型权重(仅参数), epoch={self.hyper['last_epoch']}")
+                        
+            except Exception as e:
+                log(f'无法加载checkpoint: {e}')
+        else:
+            log(f'Initializing {self.arch["name"]}...')
 
         self.logfile = f'./logs/log_{self.model_name}.log'
         log(f'Model Name:\t{self.model_name}', log=self.logfile, notime=True)

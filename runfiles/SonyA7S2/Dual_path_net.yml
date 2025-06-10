@@ -89,6 +89,7 @@ hyper:
   batch_size: 1
   last_epoch: 0
   # last_epoch: -1
+  resume_from_epoch: 900
   step_size: 10
   stop_epoch : 100
   T: 1
