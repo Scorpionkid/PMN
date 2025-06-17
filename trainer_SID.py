@@ -13,7 +13,6 @@ class SID_Trainer(Base_Trainer):
         super().__init__()
         # model
         self.net = globals()[self.arch['name']](self.arch)
-        self.net = self.net.to(self.device)
         
         # ===== 检查配置中是否启用深度可分离卷积 =====
         if self.arch.get('use_depthwise_separable', False):
@@ -21,15 +20,16 @@ class SID_Trainer(Base_Trainer):
             original_params = count_parameters(self.net)
             print(f"原始参数量: {original_params:,}")
             
-            # # 替换3x3卷积为深度可分离卷积
-            # replace_conv3x3_with_depthwise(self.net)
+            # 替换3x3卷积为深度可分离卷积
+            replace_conv3x3_with_depthwise_optimized(self.net)
             
-            # # 统计替换后的参数量
-            # new_params = count_parameters(self.net)
-            # reduction = (original_params - new_params) / original_params * 100
-            # print(f"替换后参数量: {new_params:,}")
-            # print(f"参数减少: {reduction:.1f}%")
+            # 统计替换后的参数量
+            new_params = count_parameters(self.net)
+            reduction = (original_params - new_params) / original_params * 100
+            print(f"替换后参数量: {new_params:,}")
+            print(f"参数减少: {reduction:.1f}%")
         # ===== 结束 =====
+        self.net = self.net.to(self.device)
 
         # Raw2RGB
         if 'isp' in self.dst['command'].lower():
@@ -71,13 +71,14 @@ class SID_Trainer(Base_Trainer):
         else:
             self.l1loss = Unet_Loss()
 
-        # 添加感知损失
-        if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
-            self.perceptual_loss = VGGPerceptualLoss().to(self.device)
-        
-        # 添加梯度损失
-        if 'gradient' in self.args['loss'] and self.args['loss']['gradient']:
-            self.gradient_loss = GradientLoss().to(self.device)
+        if self.loss:
+            # 添加感知损失
+            if 'perceptual' in self.args['loss'] and self.args['loss']['perceptual']:
+                self.perceptual_loss = VGGPerceptualLoss().to(self.device)
+            
+            # 添加梯度损失
+            if 'gradient' in self.args['loss'] and self.args['loss']['gradient']:
+                self.gradient_loss = GradientLoss().to(self.device)                     
 
         self.corrector = IlluminanceCorrect()
         torch.backends.cudnn.benchmark = True
@@ -93,37 +94,9 @@ class SID_Trainer(Base_Trainer):
         self.eval_ssim_dn = AverageMeter('SSIM', ':4f')
 
         # load weight
-        if self.hyper['last_epoch']:    # 不是初始化
-            try:
-                # 优先尝试加载断点
-                model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_last_model.pth')
-                if not os.path.exists(model_path):
-                    model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
-                    
-                checkpoint = torch.load(model_path, map_location=self.device)
-                
-                # 检查是否是完整的训练状态(新格式)还是仅模型权重(旧格式)
-                if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
-                    # 加载完整训练状态
-                    self.load_checkpoint(checkpoint)
-                    log(f"从epoch {checkpoint['epoch']} 恢复训练状态")
-                    # 如果加载的checkpoint与last_epoch不匹配，更新current_epoch
-                    if checkpoint['epoch'] != self.hyper['last_epoch']:
-                        log(f"注意: YML中的last_epoch为{self.hyper['last_epoch']}，已更新为checkpoint中的{checkpoint['epoch']}")
-                        self.current_epoch = checkpoint['epoch']
-                else:
-                    # 仅加载模型权重(向后兼容)
-                    self.net = load_weights(self.net, checkpoint, multi_gpu=self.multi_gpu, by_name=True)
-                    log(f"已加载模型权重(仅参数), epoch={self.hyper['last_epoch']}")
-            except Exception as e:
-                log(f'无法加载checkpoint: {e}')
-        else:
-            log(f'Initializing {self.arch["name"]}...')
-            # initialize_weights(self.net)
-            
         resume_epoch = self.hyper.get('resume_from_epoch', 0)
         
-        if resume_epoch > 0 or self.hyper['last_epoch'] > 0:  
+        if resume_epoch > 0 or self.hyper['last_epoch'] > 0:    # ✅ 新的判断条件
             try:
                 # 优先尝试加载断点
                 if resume_epoch > 0:
@@ -172,6 +145,7 @@ class SID_Trainer(Base_Trainer):
                 log(f'无法加载checkpoint: {e}')
         else:
             log(f'Initializing {self.arch["name"]}...')
+            # initialize_weights(self.net)
 
         self.logfile = f'./logs/log_{self.model_name}.log'
         log(f'Model Name:\t{self.model_name}', log=self.logfile, notime=True)
@@ -280,10 +254,10 @@ class SID_Trainer(Base_Trainer):
 
                     elif 'PBNet' in self.arch['name']:
                         # PBNet
-                        pred = outputs
+                        pred = self.net(imgs_lr, noise_map)
                         if self.dst['ori'] is True:
                             pred = pred * ratio
-                        loss, loss_values = self.PBNetloss(pred.clamp(0,1), imgs_hr)
+                        loss, loss_values = self.PBNetloss(pred.clamp(0,1), imgs_hr, imgs_lr, data['noise_params'])
                             
                     else:
                         pred = self.net(imgs_lr)
@@ -665,7 +639,6 @@ class SID_Trainer(Base_Trainer):
                             'bl': p['bl']
                         })
                     else:
-                        # 原始数据：使用get_camera_noisy_params获取完整参数
                         branch = '_highISO' if iso > 1600 else '_lowISO'
                         base_params = get_camera_noisy_params(f'{self.dst["camera_type"]}{branch}')
                         
@@ -675,7 +648,6 @@ class SID_Trainer(Base_Trainer):
                         log_ratio = math.log(Kmax/Kmin) / math.log(409600/100)
                         K = Kmin * (iso / 100) ** log_ratio
                         
-                        # 计算sigma_read
                         sigma_read = base_params['sigGsk'] * math.log(K) + base_params['sigGsb']
                         sigma_read = math.exp(sigma_read)
                         
@@ -688,7 +660,7 @@ class SID_Trainer(Base_Trainer):
                             'bl': base_params['bl']
                         }
                         noise_params.append(estimated_params)
-                data['noise_parms'] = noise_params
+                data['noise_params'] = noise_params
 
                 # TODO：noisemap
                 if self.arch.get('use_noise_map', False):
@@ -757,7 +729,7 @@ class SID_Trainer(Base_Trainer):
         total_loss = 0
         
         # 主输出损失 - 使用普通的L1损失
-        main_loss = self.l1loss(main_output, gt)
+        main_loss, _ = self.l1loss(main_output, gt)
         total_loss += main_loss
         
         # 记录详细损失值用于日志（可选）
@@ -779,7 +751,7 @@ class SID_Trainer(Base_Trainer):
         
         # 降噪路径中间监督 - 使用L1损失
         if denoise_output is not None:
-            denoise_loss = self.l1loss(denoise_output, gt)
+            denoise_loss, _ = self.l1loss(denoise_output, gt)
             total_loss += denoise_loss * 0.5  # 权重可调
             loss_values['denoise_loss'] = denoise_loss.item()
         

@@ -252,26 +252,7 @@ class BayerPositionalConv(nn.Module):
         super().__init__()
         assert in_channels == 4
         
-        # 为保持轻量级，使用分组卷积
-        self.groups = 4
-        inter_channels = out_channels
-        
-        # Bayer感知的分组卷积 - 每组处理特定的空间关系
-        self.grouped_conv = nn.Sequential(
-            nn.Conv2d(in_channels, inter_channels, 
-                     kernel_size, padding=kernel_size//2, groups=self.groups),
-            nn.InstanceNorm2d(inter_channels, affine=True),  # 添加归一化
-            nn.LeakyReLU(0.2, inplace=True)  # 添加激活函数
-        )
-        
-        # 跨通道交互 - 建模Bayer模式关系
-        self.pattern_aware = nn.Sequential(
-            # 深度可分离卷积风格
-            nn.Conv2d(inter_channels, inter_channels, 3, padding=1, groups=inter_channels),
-            nn.Conv2d(inter_channels, out_channels, 1),
-            nn.InstanceNorm2d(out_channels, affine=True),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
         
         # Bayer模式的学习权重矩阵 - 编码空间关系
         self.bayer_weights = nn.Parameter(torch.tensor([
@@ -288,12 +269,7 @@ class BayerPositionalConv(nn.Module):
         x_weighted = torch.einsum('bcxy,cd->bdxy', x, self.bayer_weights)
         
         # 分组卷积处理
-        feat = self.grouped_conv(x_weighted)
-        
-        # 跨通道交互和输出
-        output = self.pattern_aware(feat)
-
-        # output = torch.tanh(output)
+        output = self.conv(x_weighted)
         
         return output
 
@@ -326,6 +302,7 @@ class PBNet(nn.Module):
         self.bayer_entry = BayerPositionalConv(in_nc * nframes, nf, kernel_size=3)
         
         # ============ 标准CNN编码器 ============
+        self.conv1_1 = nn.Conv2d(in_nc*nframes, nf, kernel_size=3, stride=1, padding=1)
         self.conv1_2 = nn.Conv2d(nf, nf, 3, padding=1)
         self.norm1_2 = nn.InstanceNorm2d(nf, affine=True)
         self.pool1 = nn.MaxPool2d(2)
@@ -381,11 +358,13 @@ class PBNet(nn.Module):
         noise_map: 噪声图 [B, 1, H, W]
         """
         # ============ Bayer-aware入口处理 ============
-        conv1 = self.bayer_entry(x)  # [B, 4, H, W] → [B, 32, H, W]
+        # conv1 = self.bayer_entry(x)  # [B, 4, H, W] → [B, 32, H, W]
+
+        conv1 = self.relu(self.conv1_1(x))
         # 从这里开始，特征不再有严格的RGGB语义
         
         # 继续第一层处理
-        conv1 = self.relu(self.norm1_2(self.conv1_2(conv1)))
+        conv1 = self.relu(self.conv1_2(conv1))
         
         # 应用物理约束
         if self.use_physics and noise_map is not None:
@@ -544,16 +523,6 @@ class PBNetLoss(nn.Module):
         if noise_params is not None:
             K = noise_params.get('K', noise_params.get('Kmax', K))
             sigma_read = noise_params.get('sigGs', sigma_read)
-        elif iso is not None:
-            # 从ISO估算参数
-            try:
-                from data_process.process import get_camera_noisy_params_max
-                params = get_camera_noisy_params_max(f"{self.camera_type}_{int(iso)}")
-                if params:
-                    K = params.get('Kmax', K)
-                    sigma_read = params.get('sigGs', sigma_read)
-            except:
-                pass
         
         # 转换为张量
         if not isinstance(K, torch.Tensor):
@@ -578,7 +547,7 @@ class PBNetLoss(nn.Module):
     def forward(self, output, target, noisy=None, noise_params=None, iso=None):
         """计算总损失"""
         # 基础L1损失
-        l1_loss = self.base_loss(output, target)
+        l1_loss, _ = self.base_loss(output, target)
         
         # 物理约束损失
         if self.lambda_physics > 0 and noisy is not None:
