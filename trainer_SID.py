@@ -68,6 +68,10 @@ class SID_Trainer(Base_Trainer):
 
         if 'PBNet' in self.arch['name']:
             self.PBNetloss = PBNetLoss(camera_type=self.dst.get('camera_type', 'SonyA7S2'))
+
+            # 初始化监控器
+            self.physics_monitor = SimplePhysicsMonitor(model_name=self.model_name)
+
         else:
             self.l1loss = Unet_Loss()
 
@@ -257,7 +261,10 @@ class SID_Trainer(Base_Trainer):
                         pred = self.net(imgs_lr, noise_map)
                         if self.dst['ori'] is True:
                             pred = pred * ratio
-                        loss, loss_values = self.PBNetloss(pred.clamp(0,1), imgs_hr, imgs_lr, data['noise_params'])
+                        loss, loss_values = self.PBNetloss(pred.clamp(0,1), imgs_hr, imgs_lr, data['noise_params'], model=self.net, epoch=epoch)
+                        
+                        # === 使用正确的batch索引k进行监控 ===
+                        warning_flag = self.physics_monitor.monitor_batch(loss_values, epoch, k)
                             
                     else:
                         pred = self.net(imgs_lr)
@@ -285,7 +292,18 @@ class SID_Trainer(Base_Trainer):
                         self.train_psnr.update(psnr.item())
 
                     # 格式化损失值用于显示
-                    loss_str = ' '.join([f"{k}:{v:.4f}" for k, v in loss_values.items()])
+                    if 'PBNet' in self.arch['name']:
+
+                        l1 = loss_values.get('l1', 0)
+                        phy = loss_values.get('physics_weighted', 0)
+                        ratio_val = loss_values.get('ratio', 0)
+                        lambda_val = loss_values.get('lambda', 0)
+                        strategy = loss_values.get('strategy', 'unknown')[:4]
+                        
+                        loss_str = (f"L1:{l1:.4f} Phy:{phy:.4f} R:{ratio_val:.1%} "
+                                f"λ:{lambda_val:.2e} S:{strategy} {warning_flag}")
+                    else:
+                        loss_str = ' '.join([f"{k}:{v:.4f}" for k, v in loss_values.items()])
                     
                     runtime['total'] = runtime['preprocess']+runtime['dataloader']+runtime['net']+runtime['bp']
                     t.set_description(f'Epoch {epoch}')
@@ -302,6 +320,9 @@ class SID_Trainer(Base_Trainer):
             # 更新学习率
             self.scheduler.step()
             lr = self.scheduler.get_last_lr()[0]
+
+            if 'PBNet' in self.arch['name']:
+                self.physics_monitor.epoch_summary(epoch, len(self.dataloader_train))
 
             # 存储模型
             if epoch % self.hyper['save_freq'] == 0:

@@ -498,7 +498,241 @@ def test_pbnet_params():
     print("2. 物理约束模块提供噪声感知能力") 
     print("3. InstanceNorm保持样本独立性")
     print("4. 池化噪声图匹配保持真实性")
+        
 
+class DynamicPhysicsController:
+    def __init__(self, 
+                 target_ratio=0.2,           # 目标：物理损失占总损失的20%
+                 initial_lambda=0.01,        # 初始权重
+                 min_lambda=1e-5,           # 最小权重  
+                 max_lambda=0.1,            # 最大权重
+                 momentum=0.9,              # 平滑参数
+                 adaptation_rate=0.1):      # 适应速率
+        
+        self.target_ratio = target_ratio
+        self.lambda_physics = initial_lambda
+        self.min_lambda = min_lambda  
+        self.max_lambda = max_lambda
+        self.momentum = momentum
+        self.adaptation_rate = adaptation_rate
+        
+        # 历史统计
+        self.loss_history = []
+        self.lambda_history = []
+        self.moving_avg_physics = None
+        self.moving_avg_l1 = None
+        
+    def update_lambda(self, l1_loss, physics_loss_raw, epoch=None):
+        """动态更新物理损失权重"""
+        
+        # 1. 更新移动平均
+        if self.moving_avg_physics is None:
+            self.moving_avg_physics = physics_loss_raw
+            self.moving_avg_l1 = l1_loss
+        else:
+            self.moving_avg_physics = (self.momentum * self.moving_avg_physics + 
+                                     (1 - self.momentum) * physics_loss_raw)
+            self.moving_avg_l1 = (self.momentum * self.moving_avg_l1 + 
+                                (1 - self.momentum) * l1_loss)
+        
+        # 2. 基于移动平均计算目标权重
+        target_physics_loss = self.target_ratio * self.moving_avg_l1
+        target_lambda = target_physics_loss / (self.moving_avg_physics + 1e-8)
+        
+        # 3. 渐进式调整（避免剧烈变化）
+        lambda_delta = target_lambda - self.lambda_physics
+        self.lambda_physics += self.adaptation_rate * lambda_delta
+        
+        # 4. 限制在合理范围内
+        self.lambda_physics = torch.clamp(
+            torch.tensor(self.lambda_physics), 
+            self.min_lambda, 
+            self.max_lambda
+        ).item()
+        
+        # 5. 记录历史
+        self.loss_history.append({
+            'epoch': epoch,
+            'l1_loss': l1_loss,
+            'physics_loss_raw': physics_loss_raw,
+            'lambda_physics': self.lambda_physics,
+            'effective_physics': self.lambda_physics * physics_loss_raw
+        })
+        
+        return self.lambda_physics
+    
+    def get_emergency_lambda(self, physics_loss_raw, l1_loss):
+        """紧急情况下的权重计算"""
+        
+        # 如果物理损失异常大，立即降低权重
+        if physics_loss_raw > 10.0:
+            emergency_lambda = (0.1 * l1_loss) / physics_loss_raw  # 限制为L1的10%
+            return max(emergency_lambda, self.min_lambda)
+        
+        return self.lambda_physics
+    
+class GradientBalancedLoss:
+    def __init__(self, target_grad_ratio=0.3):
+        self.target_grad_ratio = target_grad_ratio  # 目标：物理梯度占总梯度的30%
+        self.grad_history = []
+        
+    def compute_balanced_loss(self, model, l1_loss, physics_loss_raw, input_data):
+        """基于梯度比例平衡损失"""
+        
+        # 1. 计算L1损失的梯度范数
+        l1_grads = torch.autograd.grad(
+            l1_loss, model.parameters(), 
+            retain_graph=True, create_graph=False
+        )
+        l1_grad_norm = sum(g.norm() for g in l1_grads if g is not None)
+        
+        # 2. 计算物理损失的梯度范数（使用单位权重）
+        unit_physics_loss = physics_loss_raw * 1.0  # 权重=1时的损失
+        physics_grads = torch.autograd.grad(
+            unit_physics_loss, model.parameters(),
+            retain_graph=True, create_graph=False
+        )
+        physics_grad_norm = sum(g.norm() for g in physics_grads if g is not None)
+        
+        # 3. 计算平衡权重
+        if physics_grad_norm > 1e-8:
+            target_physics_grad = self.target_grad_ratio * l1_grad_norm
+            balanced_lambda = target_physics_grad / physics_grad_norm
+        else:
+            balanced_lambda = 0.01  # 默认值
+            
+        # 4. 记录统计信息
+        self.grad_history.append({
+            'l1_grad_norm': l1_grad_norm.item(),
+            'physics_grad_norm': physics_grad_norm.item(),
+            'balanced_lambda': balanced_lambda.item()
+        })
+        
+        return balanced_lambda.clamp(1e-5, 0.1)
+    
+class PhysicsLossAnomalyDetector:
+    def __init__(self, window_size=100, std_threshold=3.0):
+        self.window_size = window_size
+        self.std_threshold = std_threshold
+        self.loss_buffer = []
+        
+    def is_anomaly(self, physics_loss_raw):
+        """检测当前损失是否为异常值"""
+        
+        self.loss_buffer.append(physics_loss_raw)
+        if len(self.loss_buffer) > self.window_size:
+            self.loss_buffer.pop(0)
+            
+        if len(self.loss_buffer) < 10:  # 样本不足
+            return False
+            
+        # 计算统计量
+        losses = torch.tensor(self.loss_buffer)
+        mean_loss = losses.mean()
+        std_loss = losses.std()
+        
+        # Z-score检测
+        z_score = abs(physics_loss_raw - mean_loss) / (std_loss + 1e-8)
+        
+        return z_score > self.std_threshold
+    
+    def get_robust_estimate(self):
+        """获取鲁棒的损失估计（去除异常值）"""
+        
+        if len(self.loss_buffer) < 5:
+            return None
+            
+        losses = torch.tensor(self.loss_buffer)
+        
+        # 使用中位数和MAD（中位数绝对偏差）
+        median_loss = losses.median()
+        mad = torch.median(torch.abs(losses - median_loss))
+        
+        # 过滤异常值
+        robust_losses = losses[torch.abs(losses - median_loss) < 3 * mad]
+        
+        return robust_losses.mean().item() if len(robust_losses) > 0 else median_loss.item()
+    
+class ComprehensivePhysicsController:
+    def __init__(self):
+        self.adaptive_controller = DynamicPhysicsController()
+        self.gradient_balancer = GradientBalancedLoss()
+        self.anomaly_detector = PhysicsLossAnomalyDetector()
+        
+        # 控制策略
+        self.use_gradient_balancing = True
+        self.enable_anomaly_detection = True
+        self.emergency_mode = False
+        
+    def compute_optimal_lambda(self, model, l1_loss, physics_loss_raw, 
+                              input_data, epoch=None):
+        """计算最优的物理损失权重"""
+        
+        # 1. 异常值检测
+        is_anomaly = False
+        if self.enable_anomaly_detection:
+            is_anomaly = self.anomaly_detector.is_anomaly(physics_loss_raw)
+            
+        # 2. 选择控制策略
+        if is_anomaly or physics_loss_raw > 20.0:
+            # 异常情况：使用紧急模式
+            lambda_adaptive = self.adaptive_controller.get_emergency_lambda(
+                physics_loss_raw, l1_loss
+            )
+            strategy = "emergency"
+            
+        elif self.use_gradient_balancing and not self.emergency_mode:
+            # 正常情况：基于梯度平衡
+            lambda_gradient = self.gradient_balancer.compute_balanced_loss(
+                model, l1_loss, physics_loss_raw, input_data
+            )
+            lambda_adaptive = self.adaptive_controller.update_lambda(
+                l1_loss, physics_loss_raw, epoch
+            )
+            
+            # 取两者的调和平均
+            lambda_optimal = 2 / (1/lambda_gradient + 1/lambda_adaptive)
+            strategy = "gradient_balanced"
+            
+        else:
+            # 简单自适应
+            lambda_optimal = self.adaptive_controller.update_lambda(
+                l1_loss, physics_loss_raw, epoch
+            )
+            strategy = "adaptive"
+        
+        # 3. 最终安全检查
+        effective_physics_loss = lambda_optimal * physics_loss_raw
+        if effective_physics_loss > l1_loss:  # 不允许物理损失超过L1损失
+            lambda_optimal = 0.8 * l1_loss / physics_loss_raw
+            strategy += "_capped"
+            
+        # 4. 记录和监控
+        self.log_control_decision(
+            l1_loss, physics_loss_raw, lambda_optimal, 
+            strategy, is_anomaly, epoch
+        )
+        
+        return lambda_optimal, strategy
+    
+    def log_control_decision(self, l1_loss, physics_loss_raw, lambda_opt, 
+                           strategy, is_anomaly, epoch):
+        """记录控制决策"""
+        
+        effective_physics = lambda_opt * physics_loss_raw
+        total_loss = l1_loss + effective_physics
+        physics_ratio = effective_physics / total_loss
+        
+        print(f"Epoch {epoch}: Strategy={strategy}")
+        print(f"  L1: {l1_loss:.4f}, Physics(raw): {physics_loss_raw:.4f}")
+        print(f"  Lambda: {lambda_opt:.6f}, Effective: {effective_physics:.4f}")
+        print(f"  Ratio: {physics_ratio:.1%}, Anomaly: {is_anomaly}")
+        
+        # 预警
+        if physics_ratio > 0.5:
+            print("  ⚠️  警告：物理损失仍然过高！")
+        if is_anomaly:
+            print("  🔍 检测到异常损失值")
 
 class PBNetLoss(nn.Module):
     """PBNet的损失函数，集成物理约束"""
@@ -510,9 +744,39 @@ class PBNetLoss(nn.Module):
         self.lambda_physics = lambda_physics
         self.camera_type = camera_type
         self.l2_loss = nn.MSELoss()
+
+        # 动态控制器
+        self.controller = ComprehensivePhysicsController()
         
     def compute_physics_loss(self, output, noisy, noise_params=None, iso=None):
         """计算物理约束损失"""
+        batch_size = output.shape[0]
+        
+        # 如果noise_params是列表（batch模式），处理每个样本
+        if isinstance(noise_params, list) and len(noise_params) == batch_size:
+            physics_losses = []
+            
+            for i in range(batch_size):
+                # 获取单个样本的参数
+                single_params = noise_params[i]
+                single_output = output[i:i+1]  # 保持batch维度
+                single_noisy = noisy[i:i+1]
+                
+                # 计算单个样本的物理损失
+                single_loss = self._compute_single_physics_loss(
+                    single_output, single_noisy, single_params, iso
+                )
+                physics_losses.append(single_loss)
+            
+            # 平均所有样本的物理损失
+            return torch.stack(physics_losses).mean()
+        
+        # 如果是单个字典或None，使用原始方法
+        else:
+            return self._compute_single_physics_loss(output, noisy, noise_params, iso)
+    
+    def _compute_single_physics_loss(self, output, noisy, noise_params=None, iso=None):
+        """计算单个样本的物理约束损失"""
         # 计算残差
         residual = noisy - output
         
@@ -521,8 +785,11 @@ class PBNetLoss(nn.Module):
         sigma_read = 0.01
         
         if noise_params is not None:
-            K = noise_params.get('K', noise_params.get('Kmax', K))
-            sigma_read = noise_params.get('sigGs', sigma_read)
+            if isinstance(noise_params, dict):
+                K = noise_params.get('K', noise_params.get('Kmax', K))
+                sigma_read = noise_params.get('sigGs', sigma_read)
+            else:
+                print(f"Warning: noise_params should be dict, got {type(noise_params)}")
         
         # 转换为张量
         if not isinstance(K, torch.Tensor):
@@ -541,22 +808,183 @@ class PBNetLoss(nn.Module):
         
         # 物理一致性损失
         physics_loss = self.l2_loss(actual_var, expected_var)
+        # physics_loss = F.l1_loss(actual_var, expected_var)
         
         return physics_loss
-    
-    def forward(self, output, target, noisy=None, noise_params=None, iso=None):
-        """计算总损失"""
+
+        
+    def forward(self, output, target, noisy=None, noise_params=None, 
+                iso=None, model=None, epoch=None):
+        """动态控制的损失计算"""
+        
         # 基础L1损失
         l1_loss, _ = self.base_loss(output, target)
         
-        # 物理约束损失
-        if self.lambda_physics > 0 and noisy is not None:
-            physics_loss = self.compute_physics_loss(output, noisy, noise_params, iso)
-            total_loss = l1_loss + self.lambda_physics * physics_loss
-            return total_loss, {'l1': l1_loss.item(), 'physics': physics_loss.item()}
-        else:
-            return l1_loss, {'l1': l1_loss.item(), 'physics': 0}
+        # 如果没有物理约束数据，只返回L1损失
+        if noisy is None:
+            return l1_loss, {'l1': l1_loss.item(), 'physics': 0, 'lambda': 0}
+        
+        # 计算原始物理损失
+        physics_loss_raw = self.compute_physics_loss(output, noisy, noise_params, iso)
+        
+        # 动态计算最优权重
+        optimal_lambda, strategy = self.controller.compute_optimal_lambda(
+            model, l1_loss, physics_loss_raw, output, epoch
+        )
+        
+        # 应用动态权重
+        physics_loss_weighted = optimal_lambda * physics_loss_raw
+        total_loss = l1_loss + physics_loss_weighted
+        
+        return total_loss, {
+            'l1': l1_loss.item(),
+            'physics_raw': physics_loss_raw.item(), 
+            'physics_weighted': physics_loss_weighted.item(),
+            'lambda': optimal_lambda,
+            'strategy': strategy,
+            'physics_ratio': physics_loss_weighted.item() / total_loss.item()
+        }
+    
 
+# 修正版trainer_SID.py监控集成代码
+
+class SimplePhysicsMonitor:
+    """简化版物理损失监控器 - 适配trainer_SID.py的实际结构"""
+    
+    def __init__(self, model_name='PBNet'):
+        self.model_name = model_name
+        
+        # 统计信息
+        self.total_batches = 0  # 全局batch计数器
+        self.epoch_batches = 0  # 当前epoch的batch计数
+        
+        # 监控参数
+        self.log_interval = 100  # 默认每100个batch详细记录一次
+        self.warning_ratio = 0.4  # 预警阈值
+        self.critical_ratio = 0.6  # 严重预警阈值
+        
+        # 当前epoch的统计
+        self.epoch_stats = {
+            'ratios': [],
+            'lambdas': [],
+            'anomaly_count': 0,
+            'warning_count': 0
+        }
+        
+        print(f"📊 物理损失监控器已初始化 - {model_name}")
+        
+    def monitor_batch(self, loss_info, epoch, batch_idx):
+        """监控每个batch - 使用实际的batch_idx (k)"""
+        
+        # 更新计数器
+        self.total_batches += 1
+        self.epoch_batches = batch_idx + 1  # batch_idx从0开始，所以+1
+        
+        # 提取关键信息
+        ratio = loss_info.get('ratio', 0.0)
+        lambda_val = loss_info.get('lambda', 0.0)
+        strategy = loss_info.get('strategy', 'unknown')
+        physics_raw = loss_info.get('physics_raw', 0.0)
+        
+        # 记录到epoch统计
+        self.epoch_stats['ratios'].append(ratio)
+        self.epoch_stats['lambdas'].append(lambda_val)
+        
+        # 预警检查
+        warning_flag = ""
+        if ratio > self.critical_ratio:
+            self.epoch_stats['anomaly_count'] += 1
+            warning_flag = "🚨"
+            # 立即输出严重警告
+            print(f"\n🚨 CRITICAL - Epoch {epoch}, Batch {batch_idx+1}: "
+                  f"物理损失占比 {ratio:.1%} (阈值:{self.critical_ratio:.1%})")
+                  
+        elif ratio > self.warning_ratio:
+            self.epoch_stats['warning_count'] += 1
+            warning_flag = "⚠️"
+            
+        # 异常原始损失检查
+        if physics_raw > 15.0:
+            warning_flag += "🔥"
+            
+        # 定期详细记录
+        should_log_detail = (
+            batch_idx % self.log_interval == 0 or  # 定期记录
+            ratio > self.warning_ratio or          # 有预警时
+            batch_idx < 5 or                      # epoch开始时
+            strategy in ['emergency', 'emergency_capped']  # 紧急策略时
+        )
+        
+        if should_log_detail:
+            self._log_detail(epoch, batch_idx, loss_info)
+            
+        return warning_flag
+    
+    def _log_detail(self, epoch, batch_idx, loss_info):
+        """详细日志输出"""
+        print(f"\n--- 详细监控 Epoch {epoch}, Batch {batch_idx+1}/{self.epoch_batches} ---")
+        print(f"L1损失:        {loss_info.get('l1', 0):.6f}")
+        print(f"物理损失(原始): {loss_info.get('physics_raw', 0):.6f}")
+        print(f"物理损失(加权): {loss_info.get('physics_weighted', 0):.6f}")
+        print(f"动态权重λ:     {loss_info.get('lambda', 0):.8f}")
+        print(f"控制策略:      {loss_info.get('strategy', 'unknown')}")
+        print(f"物理损失占比:   {loss_info.get('ratio', 0):.1%}")
+        print(f"全局Batch数:   {self.total_batches}")
+        print("-" * 50)
+        
+    def epoch_summary(self, epoch, total_batches_in_epoch):
+        """Epoch结束时的总结"""
+        if not self.epoch_stats['ratios']:
+            return
+        
+        # 计算统计信息
+        avg_ratio = np.mean(self.epoch_stats['ratios'])
+        max_ratio = np.max(self.epoch_stats['ratios'])
+        min_ratio = np.min(self.epoch_stats['ratios'])
+        avg_lambda = np.mean(self.epoch_stats['lambdas'])
+        
+        # 计算预警率
+        warning_rate = self.epoch_stats['warning_count'] / len(self.epoch_stats['ratios'])
+        critical_rate = self.epoch_stats['anomaly_count'] / len(self.epoch_stats['ratios'])
+        
+        # 确定日志级别
+        if critical_rate > 0.1:  # 超过10%的batch有严重问题
+            level = "🚨 CRITICAL"
+        elif warning_rate > 0.3:  # 超过30%的batch有预警
+            level = "⚠️ WARNING"
+        else:
+            level = "✅ INFO"
+            
+        # 输出总结（根据严重程度决定是否显示）
+        should_show = (
+            level != "✅ INFO" or  # 有问题时总是显示
+            epoch % 20 == 0 or    # 每20个epoch显示一次
+            epoch <= 5 or         # 前5个epoch总是显示
+            epoch >= 590          # 最后几个epoch显示
+        )
+        
+        if should_show:
+            print(f"\n📊 {level} Epoch {epoch} 物理损失总结:")
+            print(f"   处理批次: {len(self.epoch_stats['ratios'])}/{total_batches_in_epoch}")
+            print(f"   平均占比: {avg_ratio:.1%} (范围: {min_ratio:.1%} - {max_ratio:.1%})")
+            print(f"   平均权重: {avg_lambda:.6f}")
+            print(f"   预警率:   {warning_rate:.1%} ({self.epoch_stats['warning_count']}批次)")
+            if self.epoch_stats['anomaly_count'] > 0:
+                print(f"   严重率:   {critical_rate:.1%} ({self.epoch_stats['anomaly_count']}批次)")
+            print()
+            
+        # 重置epoch统计
+        self._reset_epoch_stats()
+        
+    def _reset_epoch_stats(self):
+        """重置epoch统计"""
+        self.epoch_stats = {
+            'ratios': [],
+            'lambdas': [],
+            'anomaly_count': 0,
+            'warning_count': 0
+        }
+        self.epoch_batches = 0
 
 if __name__ == '__main__':
     test_pbnet_params()
