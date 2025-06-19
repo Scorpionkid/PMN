@@ -64,15 +64,56 @@ class RealBase_Dataset(Dataset):
             
         # 优先使用噪声参数(训练时可能有)
         if noise_params is not None and self.args["mode"] == 'train':
-            return generate_noise_map(image=image, noise_params=noise_params)
-        
-        # 否则使用相机参数和ISO值(测试时使用)
-        return generate_noise_map(
-            image=image, 
-            camera_params=self.camera_params,
-            iso=iso,
-            camera_name=self.camera_name
-        )
+            noise_map = generate_noise_map(image=image, noise_params=noise_params)
+        else:
+            # 否则使用相机参数和ISO值(测试时使用)
+            noise_map = generate_noise_map(
+                image=image, 
+                camera_params=self.camera_params,
+                iso=iso,
+                camera_name=self.camera_name
+            )
+
+        # 添加归一化处理
+        if noise_map is not None:
+            # 判断是否为PyTorch张量
+            is_tensor = torch.is_tensor(noise_map)
+            
+            # 遍历每个裁剪样本进行归一化
+            # [crop_per_image, C, H, W]
+            normalized_maps = []
+            for i in range(noise_map.shape[0]):
+                single_map = noise_map[i]
+                
+                if is_tensor:
+                    map_min = torch.min(single_map)
+                    map_max = torch.max(single_map)
+                    
+                    # 避免除零错误
+                    if map_max - map_min > 1e-6:
+                        normalized = (single_map - map_min) / (map_max - map_min)
+                    else:
+                        normalized = torch.zeros_like(single_map) + 0.5
+                else:
+                    map_min = np.min(single_map)
+                    map_max = np.max(single_map)
+                    
+                    # 避免除零错误
+                    if map_max - map_min > 1e-6:
+                        normalized = (single_map - map_min) / (map_max - map_min)
+                    else:
+                        normalized = np.zeros_like(single_map) + 0.5
+                
+                normalized_maps.append(normalized)
+            
+            # 重新组合批次
+            if is_tensor:
+                noise_map = torch.stack(normalized_maps, dim=0)
+            else:
+                noise_map = np.stack(normalized_maps, axis=0)
+
+        return noise_map
+
 
     def initialization(self):
         # 获取数据地址
@@ -347,6 +388,20 @@ class SID_Dataset(RealBase_Dataset):
             self.lr_idremap_table_init()
         else:
             self.evaltest_remap()
+
+            # TODO: 198
+            if 'specific_images' in self.args and self.args['specific_images']:
+                specific_names = self.args['specific_images']  # 例如: ['10198', '10199']
+                new_infos_all = [[], [], []]
+                
+                for rid in range(3):  # 对应ratio [100, 250, 300]
+                    for info in self.infos_all[rid]:
+                        if any(name in info['name'] for name in specific_names):
+                            new_infos_all[rid].append(info)
+                
+                self.infos_all = new_infos_all
+                log(f'Filtered to specific images: {specific_names}')
+
             self.change_eval_ratio(ratio=250)
             self.length = len(self.infos)
 
@@ -432,6 +487,36 @@ class Mix_Dataset(SID_Dataset):
     def default_args(self):
         super().default_args()
 
+    def load_mat_metadata(self, mat_path):
+        """
+        从.mat文件中提取元数据（ISO, 曝光时间等）
+        """
+        import scipy.io as sio
+        try:
+            mat_data = sio.loadmat(mat_path)
+            metadata = {}
+            
+            # 提取ISO信息
+            if 'ISO' in mat_data:
+                iso_value = mat_data['ISO']
+                if isinstance(iso_value, np.ndarray):
+                    metadata['ISO'] = int(iso_value.item())
+                else:
+                    metadata['ISO'] = int(iso_value)
+            
+            # 提取曝光时间信息
+            if 'expo' in mat_data:
+                expo_value = mat_data['expo']
+                if isinstance(expo_value, np.ndarray):
+                    metadata['exposure_time'] = float(expo_value.item())
+                else:
+                    metadata['exposure_time'] = float(expo_value)
+            
+            return metadata
+        except Exception as e:
+            print(f"警告: 无法从{mat_path}提取元数据: {e}")
+            return {}
+
     def initialization(self):
         super().initialization()
         self.lr_idremap_table_init()
@@ -476,12 +561,36 @@ class Mix_Dataset(SID_Dataset):
                 lr_raw = np.array(dataload(self.infos[idx]['short'][lr_id])).reshape(self.H,self.W)
                 dgain = self.infos[idx]['ratio'][lr_id]
             else:
-                # 原有逻辑
+                # 原有逻辑，增加新的.mat暗帧支持逻辑
                 lr_id = np.random.randint(len(self.blacks[iso_index])) if self.args['mode']=='train' else 0
                 if 'lr10' in self.args['command']:
                     lr_id = np.random.randint(10)
-                lr_raw = rawpy.imread(self.blacks[iso_index][lr_id]).raw_image_visible
-                dgain = 400
+                
+                dark_frame_path = self.blacks[iso_index][lr_id]
+                
+                # 检查是否为.mat文件
+                if dark_frame_path.endswith('.mat'):
+                    # 使用修改后的dataload函数加载.mat暗帧
+                    lr_raw = dataload(dark_frame_path)
+                    
+                    # 验证尺寸
+                    if lr_raw.shape != (self.H, self.W):
+                        lr_raw = lr_raw.reshape(self.H, self.W)
+                    
+                    # 可选：验证.mat文件中的ISO与期望值是否匹配
+                    mat_metadata = self.load_mat_metadata(dark_frame_path)
+                    if 'ISO' in mat_metadata:
+                        mat_iso = mat_metadata['ISO']
+                        expected_iso = self.legalISO[iso_index]
+                        if mat_iso != expected_iso:
+                            print(f"警告: .mat文件ISO({mat_iso})与期望ISO({expected_iso})不匹配")
+                    
+                    dgain = 400  # 保持原有逻辑
+                    
+                else:
+                    # 原有的RAW文件处理逻辑
+                    lr_raw = rawpy.imread(dark_frame_path).raw_image_visible
+                    dgain = 400
         else:
             lr_id = np.random.randint(len(self.infos[idx]['short'])) if self.args['mode']=='train' else 0
             lr_raw = np.array(dataload(self.infos[idx]['short'][lr_id])).reshape(self.H,self.W)
@@ -564,6 +673,29 @@ class ELD_Dataset(RealBase_Dataset):
         with open(f"infos/{self.dataset_file}", 'rb') as info_file:
             self.infos = pkl.load(info_file)
             print(f'>> Successfully load "{self.dataset_file}" (Length: {len(self.infos)})')
+        
+        # TODO: 198
+        if 'specific_scenes' in self.args and self.args['specific_scenes']:
+            specific_scenes = self.args['specific_scenes']  # 例如: [1, 3, 5] 或 ['scene-01', 'scene-03']
+            new_infos = []
+            
+            for scene_spec in specific_scenes:
+                if isinstance(scene_spec, str):
+                    # 如果是字符串格式 'scene-01'，提取数字
+                    scene_num = int(scene_spec.split('-')[1])
+                else:
+                    # 如果直接是数字
+                    scene_num = scene_spec
+                
+                # 场景索引从0开始，所以减1
+                scene_idx = scene_num - 1
+                if 0 <= scene_idx < len(self.infos):
+                    new_infos.append(self.infos[scene_idx])
+                    log(f'Added scene-{scene_num:02d} to evaluation')
+            
+            self.infos = new_infos
+            log(f'Filtered to specific scenes: {specific_scenes}, total scenes: {len(new_infos)}')
+
         self.iso_list = self.args['iso_list']
         self.ratio_list = self.args['ratio_list']
         self.imgs_per_scene = len(self.iso_list) * len(self.ratio_list)
@@ -676,6 +808,7 @@ class ELD_Dataset(RealBase_Dataset):
             
         data["lr"] = np.ascontiguousarray(lr_crops)
         data["hr"] = np.ascontiguousarray(hr_crops)
+        
 
         return data
 
@@ -733,6 +866,7 @@ class TestDataset(RealBase_Dataset):
         data['ratio'] = self.args['ratio']
         if self.args['clip']:
             data['data'] = data['data'].clip(0,1)
+
 
         return data
 

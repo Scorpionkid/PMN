@@ -717,8 +717,28 @@ def dataload(path):
         data = rawpy.imread(path).raw_image_visible
     elif suffix in ['.npy']:
         data = np.load(path)
+    elif suffix in ['.mat']:
+        # 专门处理.mat暗帧格式
+        import scipy.io as sio  
+        mat_data = sio.loadmat(path)
+        
+        # 主图像数据在'Inoisy_crop'键下
+        if 'Inoisy_crop' in mat_data:
+            data = mat_data['Inoisy_crop']
+        else:
+            # # 备用方案：寻找最大的2D数组
+            # for key, value in mat_data.items():
+            #     if not key.startswith('__') and isinstance(value, np.ndarray) and value.ndim == 2:
+            #         data = value
+            #         break
+            # else:
+            raise ValueError(f"无法从{path}中找到图像数据")
+        
+        # 确保数据类型正确（从uint16转为float32）
+        data = data.astype(np.float32)
     elif suffix in ['.jpg', '.png', '.bmp', 'tiff']:
         data = cv2.imread(path)
+    else: raise ValueError(f"不适合的文件格式, {suffix}")
     return data
 
 def row_denoise(path, iso, data=None):
