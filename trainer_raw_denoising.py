@@ -19,9 +19,7 @@ from utils.data_utils import *
 from utils.image_utils import *
 from data_process.real_datasets import *
 from data_process.process import *
-from data_process.Enhanced_Mix_Dataset import Enhanced_Mix_Dataset
-from data_process.noise_synthesis_core import *
-from data_process.torch_noise_synthesis import *
+from data_process.Enhanced_SID_Dataset import Enhanced_SID_Dataset
 
 
 class RawDenoising_Trainer(SID_Trainer):
@@ -45,18 +43,30 @@ class RawDenoising_Trainer(SID_Trainer):
         设置raw_image_denoising特有的组件
         """
         # 从配置中读取raw_image_denoising相关参数
-        self.use_hypothesized_gain = self.dst.get('use_hypothesized_gain', True)
-        self.use_simplified_noise_synthesis = self.dst.get('use_simplified_noise_synthesis', True)
-        self.quantum_efficiency = self.dst.get('quantum_efficiency', 0.4)  # 假设量子效率40%
+        dst_config = self.dst
+        self.use_hypothesized_gain = dst_config.get('use_simplified_noise_synthesis', True)
+        self.use_simplified_noise_synthesis = dst_config.get('use_simplified_noise_synthesis', True)
+        self.quantum_efficiency = dst_config.get('quantum_efficiency', 0.4)  # 假设量子效率40%
         
-        # 初始化LLD暗帧加载器
-        self.lld_dark_frame_loader = LLD_DarkFrameLoader(
-            lld_path=self.dst.get('lld_dark_frame_path', '/data/LLD_calibration'),
-            cache_dark_frames=self.dst.get('cache_dark_frames', True)
-        )
+        # 噪声合成权重
+        self.sna_rate = dst_config.get('SNA_rate', 0.5)
+        self.enhanced_rate = dst_config.get('enhanced_rate', 0.5)
         
-        log(f"LLD暗帧加载器已初始化，支持的ISO范围: {self.lld_dark_frame_loader.available_isos}", 
-            log=self.logfile)
+        # 初始化LLD暗帧加载器（如果配置了的话）
+        if dst_config.get('use_lld_dark_frames', False):
+            self.lld_dark_frame_loader = LLD_DarkFrameLoader(
+                lld_path=dst_config.get('lld_dark_frame_path', '/data/LLD_calibration'),
+                cache_dark_frames=True
+            )
+            log(f"LLD暗帧加载器已初始化，支持的ISO范围: {self.lld_dark_frame_loader.available_isos}", 
+                log=self.logfile)
+        else:
+            self.lld_dark_frame_loader = None
+            log("未启用LLD暗帧数据", log=self.logfile)
+        
+        log(f"使用假设化系统增益方法: {self.use_hypothesized_gain}", log=self.logfile)
+        log(f"使用简化噪声合成管道: {self.use_simplified_noise_synthesis}", log=self.logfile)
+        log(f"噪声合成权重 - SNA: {self.sna_rate}, Enhanced: {self.enhanced_rate}", log=self.logfile)
     
     def hypothesize_system_gain(self, iso):
         """
@@ -179,7 +189,7 @@ class RawDenoising_Trainer(SID_Trainer):
         if self.use_gpu and mode=='train' and preprocess:
             b = imgs_lr.shape[0]
             
-            if self.args['dst_train']['dataset'] == 'Enhanced_Mix_Dataset':
+            if self.args['dst_train']['dataset'] == 'Enhanced_SID_Dataset':
                 # 使用增强的Mix_Dataset和简化噪声合成
                 data['ratio'] = data['ratio'].view(-1).type(torch.FloatTensor).to(self.device)
                 
@@ -260,15 +270,20 @@ class RawDenoising_Trainer(SID_Trainer):
         """
         根据配置决定使用哪种噪声合成方法
         """
+        # 检查数据集类型
+        dataset_name = self.args['dst_train']['dataset']
+        
+        # 只有Enhanced_SID_Dataset才使用新的噪声合成方法
+        if dataset_name != 'Enhanced_SID_Dataset':
+            return 'sna'  # 其他数据集保持PMN原有逻辑
+        
         command = self.dst.get('command', '')
         
+        # 检查是否启用了enhanced_synthesis
         if 'enhanced_synthesis' in command and self.use_simplified_noise_synthesis:
-            sna_rate = self.dst.get('SNA_rate', 0.5)
-            enhanced_rate = self.dst.get('enhanced_rate', 0.5)
-            
-            if sna_rate == 0:
+            if self.sna_rate == 0:
                 return 'simplified'
-            elif enhanced_rate == 0:
+            elif self.enhanced_rate == 0:
                 return 'sna'
             else:
                 return 'hybrid'
@@ -280,7 +295,7 @@ class RawDenoising_Trainer(SID_Trainer):
         批量简化噪声合成
         """
         # 导入PyTorch噪声合成器
-        from torch_noise_synthesis import TorchSimplifiedNoiseSynthesis
+        from data_process.torch_noise_synthesis import TorchSimplifiedNoiseSynthesis
         
         synthesizer = TorchSimplifiedNoiseSynthesis(
             quantum_efficiency=self.quantum_efficiency,
@@ -288,7 +303,9 @@ class RawDenoising_Trainer(SID_Trainer):
         )
         
         # 获取暗帧路径
-        dark_frame_paths = self.lld_dark_frame_loader.dark_frame_paths if hasattr(self.lld_dark_frame_loader, 'dark_frame_paths') else {}
+        dark_frame_paths = {}
+        if self.lld_dark_frame_loader and hasattr(self.lld_dark_frame_loader, 'dark_frame_paths'):
+            dark_frame_paths = self.lld_dark_frame_loader.dark_frame_paths
         
         # 批量合成噪声
         noisy_images = synthesizer.synthesize_batch_noise(

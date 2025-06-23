@@ -1,29 +1,31 @@
 """
-Enhanced Mix Dataset
-扩展PMN的Mix_Dataset，集成LLD暗帧数据和raw_image_denoising的噪声合成方法
+Enhanced SID Dataset
+基于SID数据集，集成LLD暗帧数据和raw_image_denoising的简化噪声合成方法
+专门针对SID训练，简化了复杂的Mix_Dataset逻辑
 """
 
 import os
 import numpy as np
 import torch
-from data_process.real_datasets import Mix_Dataset
-from data_process.process import dataload
+from data_process.real_datasets import SID_Dataset
+from data_process.process import dataload, SNA_torch
 from utils.basic_utils import log
 import scipy.io as sio
 
 
-class Enhanced_Mix_Dataset(Mix_Dataset):
+class Enhanced_SID_Dataset(SID_Dataset):
     """
-    增强版Mix_Dataset
-    集成了LLD暗帧数据和raw_image_denoising的简化噪声合成方法
+    增强版SID_Dataset
+    在原有SID数据集基础上集成LLD暗帧数据和简化噪声合成方法
     """
     
     def __init__(self, args=None):
+        # 首先初始化父类
         super().__init__(args)
         
-        # 初始化增强功能
+        # 然后添加增强功能
         self.setup_enhanced_features()
-        log(f'Enhanced_Mix_Dataset initialized with {len(self.lld_dark_frames)} LLD ISO levels')
+        log(f'Enhanced_SID_Dataset initialized with {len(self.lld_dark_frames)} LLD ISO levels')
     
     def setup_enhanced_features(self):
         """
@@ -36,6 +38,10 @@ class Enhanced_Mix_Dataset(Mix_Dataset):
         # 简化噪声合成配置
         self.use_simplified_noise_synthesis = self.args.get('use_simplified_noise_synthesis', True)
         self.quantum_efficiency = self.args.get('quantum_efficiency', 0.4)
+        
+        # 噪声合成方法选择权重
+        self.sna_rate = self.args.get('SNA_rate', 0.5)
+        self.enhanced_rate = self.args.get('enhanced_rate', 0.5)
         
         # 初始化LLD暗帧数据
         self.lld_dark_frames = {}
@@ -56,7 +62,7 @@ class Enhanced_Mix_Dataset(Mix_Dataset):
             os.path.join(self.lld_dark_frame_path, 'bias'),
             os.path.join(self.lld_dark_frame_path, 'dark_frames'),
             os.path.join(self.lld_dark_frame_path, 'SonyA7S2', 'bias'),
-            os.path.join(self.lld_dark_frame_path, 'NikonD850', 'bias')
+            os.path.join(self.lld_dark_frame_path, 'calibration', 'bias')
         ]
         
         for bias_path in lld_bias_paths:
@@ -188,81 +194,6 @@ class Enhanced_Mix_Dataset(Mix_Dataset):
             padded[start_h:end_h, start_w:end_w] = dark_frame[:end_h-start_h, :end_w-start_w]
             return padded
     
-    def record_bias_frames(self):
-        """
-        重写父类方法，集成LLD暗帧数据
-        """
-        # 首先调用父类方法，记录原有的暗帧
-        super().record_bias_frames()
-        
-        # 然后添加LLD暗帧数据
-        self.merge_lld_dark_frames()
-    
-    def merge_lld_dark_frames(self):
-        """
-        将LLD暗帧数据合并到现有的blacks结构中
-        """
-        if not self.use_lld_dark_frames:
-            return
-        
-        for iso, dark_frame_files in self.lld_dark_frames.items():
-            # 找到对应的ISO索引
-            if iso in self.legalISO:
-                iso_index = self.legalISO.index(iso)
-                
-                # 如果当前ISO没有暗帧，或者LLD暗帧更多，则使用LLD暗帧
-                if (iso_index >= len(self.blacks) or 
-                    len(self.blacks[iso_index]) == 0 or 
-                    len(dark_frame_files) > len(self.blacks[iso_index])):
-                    
-                    # 确保blacks数组足够大
-                    while len(self.blacks) <= iso_index:
-                        self.blacks.append([])
-                    
-                    # 添加LLD暗帧文件
-                    self.blacks[iso_index].extend(dark_frame_files)
-                    log(f"为ISO {iso} 添加了 {len(dark_frame_files)} 个LLD暗帧")
-    
-    def enhanced_noise_synthesis(self, clean_image, iso, ratio=1.0, aug_wb=None):
-        """
-        增强的噪声合成方法
-        集成raw_image_denoising的简化噪声合成管道
-        
-        Args:
-            clean_image: 清洁图像 (numpy array)
-            iso: ISO值
-            ratio: 数字增益
-            aug_wb: 白平衡增强参数
-        
-        Returns:
-            noisy_image: 合成的带噪图像
-        """
-        if not self.use_simplified_noise_synthesis:
-            # 回退到PMN的SNA方法
-            from data_process.process import SNA_torch
-            if aug_wb is None:
-                aug_wb = np.array([0, 0, 0, 0])
-            dn, dy, p = SNA_torch(
-                clean_image, aug_wb, iso=iso, ratio=ratio,
-                black_lr=True, camera_type=self.args.get('camera_type', 'SonyA7S2')
-            )
-            return dn
-        
-        # 使用简化的噪声合成管道
-        # 1. 假设化系统增益
-        system_gain = self.hypothesize_system_gain(iso)
-        
-        # 2. 合成光子散粒噪声
-        photon_noise = self.synthesize_photon_noise(clean_image, system_gain, ratio)
-        
-        # 3. 获取信号无关噪声（通过LLD暗帧采样）
-        signal_independent_noise = self.get_signal_independent_noise(clean_image.shape, iso)
-        
-        # 4. 合成最终噪声图像
-        noisy_image = clean_image * ratio + photon_noise + signal_independent_noise
-        
-        return noisy_image
-    
     def hypothesize_system_gain(self, iso):
         """
         假设化系统增益计算
@@ -303,6 +234,51 @@ class Enhanced_Mix_Dataset(Mix_Dataset):
         signal_independent_noise = np.random.normal(0, noise_std, image_shape)
         return signal_independent_noise.astype(np.float32)
     
+    def enhanced_noise_synthesis(self, clean_image, iso, ratio=1.0):
+        """
+        增强的噪声合成方法
+        集成raw_image_denoising的简化噪声合成管道
+        
+        Args:
+            clean_image: 清洁图像 (numpy array)
+            iso: ISO值
+            ratio: 数字增益
+        
+        Returns:
+            noisy_image: 合成的带噪图像
+        """
+        # 使用简化的噪声合成管道
+        # 1. 假设化系统增益
+        system_gain = self.hypothesize_system_gain(iso)
+        
+        # 2. 合成光子散粒噪声
+        photon_noise = self.synthesize_photon_noise(clean_image, system_gain, ratio)
+        
+        # 3. 获取信号无关噪声（通过LLD暗帧采样）
+        signal_independent_noise = self.get_signal_independent_noise(clean_image.shape, iso)
+        
+        # 4. 合成最终噪声图像
+        noisy_image = clean_image * ratio + photon_noise + signal_independent_noise
+        
+        return noisy_image
+    
+    def choose_synthesis_method(self):
+        """
+        根据权重随机选择噪声合成方法
+        """
+        if not self.use_simplified_noise_synthesis:
+            return 'sna'
+        
+        total_weight = self.sna_rate + self.enhanced_rate
+        if total_weight == 0:
+            return 'sna'  # 默认方法
+        
+        # 根据权重随机选择
+        if np.random.rand() < self.sna_rate / total_weight:
+            return 'sna'
+        else:
+            return 'enhanced'
+    
     def __getitem__(self, idx):
         """
         重写数据获取方法，集成增强的噪声合成
@@ -310,31 +286,59 @@ class Enhanced_Mix_Dataset(Mix_Dataset):
         # 首先调用父类方法获取基础数据
         data = super().__getitem__(idx)
         
-        # 如果启用了增强噪声合成，则进行额外处理
-        if (self.use_simplified_noise_synthesis and 
-            self.args.get('mode') == 'train' and 
+        # 如果是训练模式且启用了增强噪声合成
+        if (self.args.get('mode') == 'train' and 
+            self.use_simplified_noise_synthesis and
             'enhanced_synthesis' in self.args.get('command', '')):
             
             # 获取清洁图像和相关参数
             hr_image = data['hr']
             iso = data['ISO']
+            ratio = data.get('ratio', 1.0)
             
-            # 应用增强的噪声合成
-            if isinstance(hr_image, np.ndarray) and hr_image.size > 0:
+            # 选择噪声合成方法
+            synthesis_method = self.choose_synthesis_method()
+            
+            if synthesis_method == 'enhanced' and isinstance(hr_image, np.ndarray) and hr_image.size > 0:
+                # 使用增强的噪声合成
                 enhanced_lr = self.enhanced_noise_synthesis(
                     hr_image.copy(), 
                     iso=iso, 
-                    ratio=data.get('ratio', 1.0)
+                    ratio=ratio
                 )
-                data['lr_enhanced'] = enhanced_lr
+                data['lr'] = enhanced_lr
+                data['synthesis_method'] = 'enhanced'
+            else:
+                # 标记使用了SNA方法（在GPU预处理中会处理）
+                data['synthesis_method'] = 'sna'
         
         return data
+    
+    def get_dark_frame_paths(self):
+        """
+        获取暗帧路径字典，供PyTorch噪声合成器使用
+        """
+        return self.lld_dark_frames.copy()
+    
+    def get_synthesis_info(self):
+        """
+        获取噪声合成相关信息
+        """
+        return {
+            'use_lld_dark_frames': self.use_lld_dark_frames,
+            'use_simplified_noise_synthesis': self.use_simplified_noise_synthesis,
+            'quantum_efficiency': self.quantum_efficiency,
+            'sna_rate': self.sna_rate,
+            'enhanced_rate': self.enhanced_rate,
+            'available_lld_isos': sorted(self.lld_dark_frames.keys()),
+            'total_dark_frames': sum(len(frames) for frames in self.lld_dark_frames.values())
+        }
 
 
-# 辅助函数：检查LLD数据集可用性
-def check_lld_availability(lld_path):
+# 辅助函数：检查LLD数据集可用性（简化版）
+def check_lld_availability_for_sid(lld_path):
     """
-    检查LLD数据集的可用性
+    检查LLD数据集对SID训练的可用性
     
     Args:
         lld_path: LLD数据集路径
@@ -355,12 +359,15 @@ def check_lld_availability(lld_path):
         return availability_info
     
     try:
+        # SID数据集常用的ISO范围
+        sid_common_isos = [100, 400, 800, 1600, 3200, 6400]
+        
         # 扫描可能的暗帧目录
         bias_paths = [
             os.path.join(lld_path, 'bias'),
             os.path.join(lld_path, 'dark_frames'),
             os.path.join(lld_path, 'SonyA7S2', 'bias'),
-            os.path.join(lld_path, 'NikonD850', 'bias')
+            os.path.join(lld_path, 'calibration', 'bias')
         ]
         
         total_frames = 0
@@ -378,10 +385,15 @@ def check_lld_availability(lld_path):
                             supported_isos.append(iso)
                             total_frames += len(mat_files)
         
+        # 检查对SID训练的覆盖度
+        sid_coverage = len(set(supported_isos) & set(sid_common_isos))
+        
         availability_info['available'] = len(supported_isos) > 0
         availability_info['iso_count'] = len(supported_isos)
         availability_info['total_dark_frames'] = total_frames
         availability_info['supported_isos'] = sorted(supported_isos)
+        availability_info['sid_coverage'] = sid_coverage
+        availability_info['sid_coverage_percent'] = (sid_coverage / len(sid_common_isos)) * 100
         
     except Exception as e:
         availability_info['errors'].append(f"扫描LLD数据时出错: {e}")
@@ -390,20 +402,24 @@ def check_lld_availability(lld_path):
 
 
 if __name__ == '__main__':
-    # 测试Enhanced_Mix_Dataset
+    # 测试Enhanced_SID_Dataset
     test_args = {
         'use_lld_dark_frames': True,
         'lld_dark_frame_path': '/data/LLD_calibration',
         'use_simplified_noise_synthesis': True,
         'quantum_efficiency': 0.4,
+        'SNA_rate': 0.3,
+        'enhanced_rate': 0.7,
         'mode': 'train',
         'command': 'enhanced_synthesis',
-        'camera_type': 'SonyA7S2'
+        'camera_type': 'SonyA7S2',
+        'SID_path': '/data/SID/Sony',  # SID数据路径
+        'dstname': 'SID'
     }
     
     # 检查LLD可用性
-    lld_info = check_lld_availability(test_args['lld_dark_frame_path'])
-    print("LLD可用性检查结果:")
+    lld_info = check_lld_availability_for_sid(test_args['lld_dark_frame_path'])
+    print("LLD可用性检查结果（针对SID训练）:")
     for key, value in lld_info.items():
         print(f"  {key}: {value}")
     
@@ -411,6 +427,20 @@ if __name__ == '__main__':
         print(f"\n✓ LLD数据集可用，支持 {lld_info['iso_count']} 个ISO级别")
         print(f"  总暗帧数: {lld_info['total_dark_frames']}")
         print(f"  支持的ISO: {lld_info['supported_isos']}")
+        print(f"  SID覆盖度: {lld_info['sid_coverage']}/{len([100, 400, 800, 1600, 3200, 6400])} ({lld_info['sid_coverage_percent']:.1f}%)")
+        
+        # 测试数据集创建
+        try:
+            dataset = Enhanced_SID_Dataset(test_args)
+            print(f"\n✓ Enhanced_SID_Dataset创建成功")
+            
+            synthesis_info = dataset.get_synthesis_info()
+            print("噪声合成信息:")
+            for key, value in synthesis_info.items():
+                print(f"  {key}: {value}")
+                
+        except Exception as e:
+            print(f"\n✗ Enhanced_SID_Dataset创建失败: {e}")
     else:
         print(f"\n✗ LLD数据集不可用")
         for error in lld_info['errors']:

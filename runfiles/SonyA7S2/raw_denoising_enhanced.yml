@@ -1,164 +1,93 @@
 # Raw Image Denoising Enhanced Configuration
-# 基于PMN框架集成raw_image_denoising的简化噪声合成管道
-# 使用Enhanced_Mix_Dataset和LLD暗帧数据
+# 基于PMN的Ours.yml，添加raw_image_denoising论文的简化噪声合成方法
 
-# 数据集配置
-dst_train:
-  dataset: Enhanced_Mix_Dataset
-  dstname: MIX_LRID_SID
-  # 基础数据路径
-  LRID_path: /data/LRID
-  SID_path: /data/SID/Sony
+mode: 'evaltest'
+checkpoint: 'saved_model/'
+fast_ckpt: 'checkpoints/SonyA7S2'
+model_name: 'SonyA7S2_RawDenoising_Unet'
+result_dir: 'images/'
+num_gpu: 1
+num_workers: 4
+brightness_correct: True
+
+dst: &base_dst
+  root_dir: '/data/SID'
+  bias_dir: '/data/SonyA7S2/bias'
+  ds_dir: 'resources/SonyA7S2'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
+  command: 'augv2, idremap, darkshading2++, HB'
+  camera_type: 'SonyA7S2'
+  noise_code: 'pgrq'
+  patch_size: 512
+  H: 2848
+  W: 4256
+  crop_per_image: 8
+  croptype: 'non-overlapping'
+  wp: 16383
+  bl: 512
+  ori: False
+  clip: True
+  gpu_preprocess: True
   
-  # LLD暗帧配置
+  # === Raw Image Denoising 新增配置 ===
+  # LLD暗帧数据配置
   use_lld_dark_frames: True
-  lld_dark_frame_path: /data/LLD_calibration
-  cache_dark_frames: True
+  lld_dark_frame_path: '/data/LLD_calibration'
   
-  # Raw Image Denoising噪声合成配置
+  # 简化噪声合成配置
   use_simplified_noise_synthesis: True
-  use_hypothesized_gain: True
   quantum_efficiency: 0.4  # 假设量子效率40%
   
-  # PMN增强功能保留
-  gpu_preprocess: True
-  mode: train
-  camera_type: SonyA7S2
-  noise_code: ELD
-  
-  # 训练命令组合
-  # aug_v3: 使用PMN的SNA v3
-  # HB: 使用黑图增强
-  # darkshading: 使用暗场校正
-  # enhanced_synthesis: 启用简化噪声合成
-  command: aug_v3,HB,darkshading,enhanced_synthesis
-  
-  # 数据增强参数
-  crop_per_image: 40
-  crop_size: 512
-  
-  # 噪声合成权重
-  SNA_rate: 0.5  # PMN SNA方法的使用比例
-  enhanced_rate: 0.5  # 简化噪声合成的使用比例
+  # 噪声合成方法权重
+  SNA_rate: 0.3        # PMN原始SNA方法权重
+  enhanced_rate: 0.7   # 简化噪声合成权重
+
+dst_train:
+  <<: *base_dst
+  mode: 'train'
+  dataset: 'Enhanced_SID_Dataset'  # 使用增强的SID数据集
+  dstname: 'SID'
+  command: 'augv2, idremap, darkshading2++, HB, enhanced_synthesis'  # 添加enhanced_synthesis
 
 dst_eval:
-  dataset: SID_Dataset
-  dstname: SID
-  SID_path: /data/SID/Sony
-  mode: evaltest
-  camera_type: SonyA7S2
-  noise_code: ELD
-  command: darkshading
-  
+  <<: *base_dst
+  root_dir: '/data/ELD'
+  mode: 'eval'
+  dataset: 'ELD_Dataset' 
+  dstname: 'ELD'
+  iso_list: [800, 1600, 3200]
+  ratio_list: [100, 200]
+
 dst_test:
-  dataset: ELD_Dataset  
-  dstname: ELD
-  ELD_path: /data/ELD
-  mode: SonyA7S2
-  camera_type: SonyA7S2
-  noise_code: ELD
-  command: darkshading
+  <<: *base_dst
+  mode: 'evaltest'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
 
-# 网络配置
-net:
-  name: UNet
-  in_channels: 4
-  out_channels: 4
-  base_channels: 32
+arch:
+  name: 'UNetSeeInDark'
+  in_nc: 4
+  out_nc: 4
+  nf: 32
+  nframes: 1
+  use_dpsv: False
+  res: False
+  cascade: False
+  add: False
+  lock_wb: False
 
-# 训练超参数
 hyper:
-  stop_epoch: 1000
-  lr: 0.0002
-  lr_min: 0.00001
-  restart_epoch: 200
-  optimizer: Adam
-  loss: L1
-  
-  # Raw Image Denoising特有参数
-  noise_synthesis_weight: 1.0
-  system_gain_variance: 0.1  # 假设增益的变化范围
-  dark_frame_augmentation: True
-
-# 硬件配置
-device: cuda
-multi_gpu: True
-num_workers: 8
-
-# 日志和保存配置
-save_plot: True
-plot_freq: 50
-save_freq: 50
-eval_freq: 50
-
-# 特殊配置用于对比实验
-experiments:
-  # 仅使用PMN方法的对比配置
-  pmn_only:
-    use_simplified_noise_synthesis: False
-    use_lld_dark_frames: False
-    command: aug_v3,HB,darkshading
-  
-  # 仅使用简化噪声合成的配置
-  simplified_only:
-    use_simplified_noise_synthesis: True
-    use_lld_dark_frames: True
-    command: enhanced_synthesis,darkshading
-    SNA_rate: 0.0
-    enhanced_rate: 1.0
-  
-  # 混合方法配置
-  hybrid:
-    use_simplified_noise_synthesis: True
-    use_lld_dark_frames: True
-    command: aug_v3,HB,darkshading,enhanced_synthesis
-    SNA_rate: 0.3
-    enhanced_rate: 0.7
-
-# 路径配置
-paths:
-  checkpoints: ./checkpoints
-  logs: ./logs
-  samples: ./samples
-  fast_ckpt: ./fast_ckpt
-  resources: ./resources
-
-# 数据预处理配置
-preprocessing:
-  # 保留PMN的预处理逻辑
-  normalize: False
-  augmentation: True
-  random_crop: True
-  random_flip: True
-  
-  # 新增的预处理选项
-  dark_frame_preprocessing: True
-  noise_estimation: True
-  bit_depth_recovery: True
-
-# 评估配置
-evaluation:
-  metrics: [PSNR, SSIM]
-  save_images: True
-  compare_with_pmn: True
-  
-  # 对比实验评估
-  ablation_studies:
-    - name: "no_lld_frames"
-      use_lld_dark_frames: False
-    - name: "no_simplified_synthesis" 
-      use_simplified_noise_synthesis: False
-    - name: "different_quantum_efficiency"
-      quantum_efficiency: [0.2, 0.4, 0.6, 0.8]
-
-# 调试和监控配置
-debug:
-  verbose_logging: True
-  save_intermediate_results: False
-  profile_performance: False
-  check_data_consistency: True
-  
-  # 噪声合成调试
-  save_noise_maps: False
-  save_dark_frames: False
-  compare_noise_methods: True
+  lr_scheduler: 'WarmupCosine'
+  learning_rate: 2.e-4
+  batch_size: 1
+  last_epoch: 0
+  step_size: 10
+  stop_epoch : 1800
+  T: 3
+  coldstart: False
+  num_workers: 4
+  num_gpus: 1
+  save_freq: 10
+  plot_freq: 100
+  best_psnr: 0.
