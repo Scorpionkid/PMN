@@ -11,3 +11,4 @@ metrics/*
 .history/*
 trainer_raw_denoising copy.py
 data_process/Enhanced_Mix_Dataset copy.py
+runfiles/SonyA7S2/raw_denoising_enhanced copy.yml

@@ -14,12 +14,10 @@ from tqdm import tqdm
 
 # 导入PMN的基础组件
 from trainer_SID import SID_Trainer, MultiProcessPlot, timestamp, tensor_dim5to4
-from utils.basic_utils import *
-from utils.data_utils import *
-from utils.image_utils import *
+from utils import *
 from data_process.real_datasets import *
 from data_process.process import *
-from data_process.Enhanced_SID_Dataset import Enhanced_SID_Dataset
+from data_process.Enhanced_Mix_Dataset import Enhanced_Mix_Dataset
 
 
 class RawDenoising_Trainer(SID_Trainer):
@@ -189,7 +187,7 @@ class RawDenoising_Trainer(SID_Trainer):
         if self.use_gpu and mode=='train' and preprocess:
             b = imgs_lr.shape[0]
             
-            if self.args['dst_train']['dataset'] == 'Enhanced_SID_Dataset':
+            if self.args['dst_train']['dataset'] == 'Enhanced_Mix_Dataset':
                 # 使用增强的Mix_Dataset和简化噪声合成
                 data['ratio'] = data['ratio'].view(-1).type(torch.FloatTensor).to(self.device)
                 
@@ -275,8 +273,8 @@ class RawDenoising_Trainer(SID_Trainer):
         # 检查数据集类型
         dataset_name = self.args['dst_train']['dataset']
         
-        # 只有Enhanced_SID_Dataset才使用新的噪声合成方法
-        if dataset_name != 'Enhanced_SID_Dataset':
+        # 只有Enhanced_Mix_Dataset才使用新的噪声合成方法
+        if dataset_name != 'Enhanced_Mix_Dataset':
             return 'sna'  # 其他数据集保持PMN原有逻辑
         
         command = self.dst.get('command', '')
