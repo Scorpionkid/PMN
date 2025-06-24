@@ -249,7 +249,7 @@ class RawDenoising_Trainer(SID_Trainer):
                                 imgs_lr[i] = dn
                 
                 else:
-                    # 仅使用PMN的SNA方法
+                    # 使用PMN的SNA方法
                     for i in range(b):
                         if np.abs(aug_wb_list[i]).max() != 0:
                             dn, dy, p = SNA_torch(
@@ -257,7 +257,9 @@ class RawDenoising_Trainer(SID_Trainer):
                                 ratio=ratio_list[i], black_lr=data['black_lr'][0],
                                 camera_type=self.dst['camera_type']
                             )
-                            imgs_lr[i] = dn
+                            # 正确的PMN实现：dn和dy是增量，需要加到原图像上
+                            imgs_lr[i] = imgs_lr[i] + dn  # 加噪声增量
+                            imgs_hr[i] = imgs_hr[i] + dy  # 加清洁图像增量
                         
             elif 'SNA' in self.dst['command']:
                 # 保持与原有SNA的兼容性
@@ -385,7 +387,7 @@ class LLD_DarkFrameLoader:
                             self.available_isos.append(iso)
         except Exception as e:
             log(f"扫描暗帧目录 {bias_path} 时出错: {e}")
-
+    
     def _extract_iso_from_filename(self, filename):
         """
         从文件名中提取ISO信息

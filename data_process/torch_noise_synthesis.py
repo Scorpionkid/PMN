@@ -66,7 +66,7 @@ class TorchSimplifiedNoiseSynthesis:
         
         # 生成均匀分布的随机增益
         random_factor = torch.rand_like(nominal_gain, device=self.device) * 2 - 1  # [-1, 1]
-        random_gain = nominal_gain + random_factor * variance
+        random_gain = nominal_gain + random_facator * variance
         
         return torch.clamp(random_gain, min=0.01)  # 确保增益为正
     
@@ -389,19 +389,10 @@ def integrated_noise_synthesis_torch(clean_image: torch.Tensor,
     集成的噪声合成函数
     可以直接替换PMN中的SNA_torch调用
     
-    Args:
-        clean_image: 清洁图像
-        aug_wb: 白平衡增强参数
-        iso: ISO值
-        ratio: 数字增益
-        black_lr: 是否使用黑图
-        camera_type: 相机类型
-        dark_frame_paths: 暗帧路径字典
-        use_simplified: 是否使用简化噪声合成
-        quantum_efficiency: 量子效率
-        
-    Returns:
-        (noisy_image, enhanced_image, noise_params): 与SNA_torch相同的返回格式
+    返回格式与PMN的SNA_torch保持一致：
+    - dn: 噪声增量（需要加到原图像上）
+    - dy: 清洁图像增量（需要加到原图像上）
+    - noise_params: 噪声参数
     """
     if use_simplified and dark_frame_paths and iso in dark_frame_paths:
         # 使用简化噪声合成
@@ -416,17 +407,20 @@ def integrated_noise_synthesis_torch(clean_image: torch.Tensor,
         else:
             clean_image_batch = clean_image
         
+        # 合成完整的带噪图像
         noisy_batch = synthesizer.synthesize_batch_noise(
             clean_image_batch, [iso], [ratio], dark_frame_paths, use_random_gain=True
         )
         
         noisy_image = noisy_batch.squeeze(0) if clean_image.dim() == 3 else noisy_batch
         
-        # 为了兼容PMN的接口，返回相同格式
-        enhanced_image = noisy_image  # 简化版本中没有单独的增强步骤
+        # 计算增量以匹配PMN接口
+        scaled_clean = clean_image * ratio
+        dn = noisy_image - scaled_clean  # 噪声增量
+        dy = scaled_clean - clean_image  # 清洁图像的比例增量
         noise_params = torch.tensor([iso, ratio], device=device)
         
-        return noisy_image, enhanced_image, noise_params
+        return dn, dy, noise_params
     
     else:
         # 回退到PMN的SNA方法
