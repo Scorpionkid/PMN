@@ -9,3 +9,5 @@ metrics/*
 *.log
 *.info
 .history/*
+trainer_raw_denoising copy.py
+data_process/Enhanced_Mix_Dataset copy.py

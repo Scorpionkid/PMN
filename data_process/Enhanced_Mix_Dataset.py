@@ -294,31 +294,15 @@ class Enhanced_SID_Dataset(SID_Dataset):
         # 首先调用父类方法获取基础数据
         data = super().__getitem__(idx)
         
-        # 如果是训练模式且启用了增强噪声合成
-        if (self.args.get('mode') == 'train' and 
-            self.use_simplified_noise_synthesis and
-            'enhanced_synthesis' in self.args.get('command', '')):
-            
-            # 获取清洁图像和相关参数
-            hr_image = data['hr']
-            iso = data['ISO']
-            ratio = data.get('ratio', 1.0)
-            
-            # 选择噪声合成方法
-            synthesis_method = self.choose_synthesis_method()
-            
-            if synthesis_method == 'enhanced' and isinstance(hr_image, np.ndarray) and hr_image.size > 0:
-                # 使用增强的噪声合成
-                enhanced_lr = self.enhanced_noise_synthesis(
-                    hr_image.copy(), 
-                    iso=iso, 
-                    ratio=ratio
-                )
-                data['lr'] = enhanced_lr
-                data['synthesis_method'] = 'enhanced'
-            else:
-                # 标记使用了SNA方法（在GPU预处理中会处理）
-                data['synthesis_method'] = 'sna'
+        # 添加噪声合成相关的元数据，但不在这里执行噪声合成
+        data['lld_available'] = self.use_lld_dark_frames and len(self.lld_dark_frames) > 0
+        data['dark_frame_paths'] = self.get_dark_frame_paths() if self.use_lld_dark_frames else {}
+        data['synthesis_config'] = {
+            'use_simplified_noise_synthesis': self.use_simplified_noise_synthesis,
+            'quantum_efficiency': self.quantum_efficiency,
+            'sna_rate': self.sna_rate,
+            'enhanced_rate': self.enhanced_rate
+        }
         
         return data
     

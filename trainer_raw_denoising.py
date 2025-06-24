@@ -292,7 +292,7 @@ class RawDenoising_Trainer(SID_Trainer):
         else:
             return 'sna'
     
-    def batch_simplified_noise_synthesis(self, clean_images, iso_list, ratio_list):
+    def batch_simplified_noise_synthesis(self, clean_images, iso_list, ratio_list, dark_frame_paths=None):
         """
         批量简化噪声合成
         """
@@ -304,10 +304,9 @@ class RawDenoising_Trainer(SID_Trainer):
             device=self.device
         )
         
-        # 获取暗帧路径
-        dark_frame_paths = {}
-        if self.lld_dark_frame_loader and hasattr(self.lld_dark_frame_loader, 'dark_frame_paths'):
-            dark_frame_paths = self.lld_dark_frame_loader.dark_frame_paths
+        # 使用传入的暗帧路径，如果没有则尝试从加载器获取
+        if dark_frame_paths is None and self.lld_dark_frame_loader:
+            dark_frame_paths = getattr(self.lld_dark_frame_loader, 'dark_frame_paths', {})
         
         # 批量合成噪声
         noisy_images = synthesizer.synthesize_batch_noise(
