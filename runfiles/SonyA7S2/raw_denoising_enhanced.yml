@@ -4,19 +4,19 @@
 mode: 'evaltest'
 checkpoint: 'saved_model/'
 fast_ckpt: 'checkpoints/SonyA7S2'
-model_name: 'SonyA7S2_RawDenoising_Unet'
+model_name: 'SonyA7S2_RawDenoising(cvpr25)_Unet'
 result_dir: 'images/'
 num_gpu: 1
 num_workers: 4
 brightness_correct: True
 
 dst: &base_dst
-  root_dir: '/data/SID'
-  bias_dir: '/data/SonyA7S2/bias'
+  root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/SID'
+  bias_dir: 'resources'
   ds_dir: 'resources/SonyA7S2'
   dataset: 'SID_Dataset' 
   dstname: 'SID'
-  command: 'augv2, idremap, darkshading2++, HB'
+  command: 'augv2, idremap, darkshading2++, enhanced_synthesis'
   camera_type: 'SonyA7S2'
   noise_code: 'pgrq'
   patch_size: 512
@@ -33,37 +33,38 @@ dst: &base_dst
   # === Raw Image Denoising 新增配置 ===
   # LLD暗帧数据配置
   use_lld_dark_frames: True
-  lld_dark_frame_path: '/data/LLD_calibration'
+  lld_dark_frame_path: 'resources'
   
   # 简化噪声合成配置
   use_simplified_noise_synthesis: True
-  quantum_efficiency: 0.4  # 假设量子效率40%
+  quantum_efficiency: 0.5  # 假设量子效率40%
   
   # 噪声合成方法权重
-  SNA_rate: 0.3        # PMN原始SNA方法权重
-  enhanced_rate: 0.7   # 简化噪声合成权重
+  SNA_rate: 0.0        # PMN原始SNA方法权重
+  enhanced_rate: 1.0   # 简化噪声合成权重
 
 dst_train:
   <<: *base_dst
   mode: 'train'
-  dataset: 'Enhanced_SID_Dataset'  # 使用增强的SID数据集
+  dataset: 'Enhanced_SID_Dataset' 
   dstname: 'SID'
-  command: 'augv2, idremap, darkshading2++, HB, enhanced_synthesis'  # 添加enhanced_synthesis
 
 dst_eval:
   <<: *base_dst
-  root_dir: '/data/ELD'
+  root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/ELD/ELD'
   mode: 'eval'
   dataset: 'ELD_Dataset' 
   dstname: 'ELD'
   iso_list: [800, 1600, 3200]
   ratio_list: [100, 200]
+  # specific_scenes: [1]  # 只测试scene-01，或者 ['scene-01']
 
 dst_test:
   <<: *base_dst
   mode: 'evaltest'
   dataset: 'SID_Dataset' 
   dstname: 'SID'
+  # specific_images: ['10198']  # 指定要测试的图片名称
 
 arch:
   name: 'UNetSeeInDark'
@@ -82,6 +83,7 @@ hyper:
   learning_rate: 2.e-4
   batch_size: 1
   last_epoch: 0
+  resume_from_epoch: 
   step_size: 10
   stop_epoch : 1800
   T: 3
