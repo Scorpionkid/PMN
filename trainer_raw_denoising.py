@@ -360,7 +360,7 @@ class LLD_DarkFrameLoader:
                 item_path = os.path.join(bias_path, item)
                 
                 if os.path.isdir(item_path) and item.isdigit():
-                    # ISO目录
+                    # ISO目录（如 2500/, 3200/）
                     iso = int(item)
                     dark_frame_files = []
                     
@@ -385,12 +385,19 @@ class LLD_DarkFrameLoader:
                             self.available_isos.append(iso)
         except Exception as e:
             log(f"扫描暗帧目录 {bias_path} 时出错: {e}")
-    
+
     def _extract_iso_from_filename(self, filename):
         """
         从文件名中提取ISO信息
         """
         import re
+        
+        # 支持 dark_2500_0001.mat 格式
+        match = re.search(r'dark_(\d+)_\d+', filename.lower())
+        if match:
+            return int(match.group(1))
+        
+        # 原有的其他格式
         patterns = [
             r'iso[\s_-]*(\d+)',
             r'(\d+)iso',

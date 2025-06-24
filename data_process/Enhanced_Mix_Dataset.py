@@ -59,10 +59,10 @@ class Enhanced_SID_Dataset(SID_Dataset):
         
         # 扫描LLD数据结构
         lld_bias_paths = [
-            os.path.join(self.lld_dark_frame_path, 'bias'),
-            os.path.join(self.lld_dark_frame_path, 'dark_frames'),
-            os.path.join(self.lld_dark_frame_path, 'SonyA7S2', 'bias'),
-            os.path.join(self.lld_dark_frame_path, 'calibration', 'bias')
+            os.path.join(self.lld_dark_frame_path, 'SonyA7S2', 'BiasFrame_ET_1_30'),  # 实际结构
+            os.path.join(self.lld_dark_frame_path, 'BiasFrame_ET_1_30'),              # 备选路径
+            os.path.join(self.lld_dark_frame_path, 'bias'),                           # 原有路径
+            os.path.join(self.lld_dark_frame_path, 'dark_frames'),                    # 原有路径
         ]
         
         for bias_path in lld_bias_paths:
@@ -112,46 +112,39 @@ class Enhanced_SID_Dataset(SID_Dataset):
     
     def _extract_iso_from_mat(self, mat_path):
         """
-        从.mat文件中提取ISO信息
+        从LLD .mat文件中提取ISO信息
         """
         try:
-            # 首先尝试从文件名提取
-            file_name = os.path.basename(mat_path)
-            if 'iso' in file_name.lower():
-                # 查找iso后面的数字
-                import re
-                match = re.search(r'iso[\s_-]*(\d+)', file_name.lower())
-                if match:
-                    return int(match.group(1))
-            
-            # 尝试从.mat文件内容提取
+            # 优先从文件内容提取（更准确）
+            import scipy.io as sio
             mat_data = sio.loadmat(mat_path)
+            
             if 'ISO' in mat_data:
                 iso_value = mat_data['ISO']
-                if isinstance(iso_value, np.ndarray):
+                if hasattr(iso_value, 'item'):
                     return int(iso_value.item())
                 else:
                     return int(iso_value)
+            
+            # 备选：从文件名提取
+            file_name = os.path.basename(mat_path)
+            import re
+            match = re.search(r'dark_(\d+)_\d+\.mat', file_name.lower())
+            if match:
+                return int(match.group(1))
+                
         except Exception as e:
-            log(f"从{mat_path}提取ISO信息失败: {e}")
+            log(f"从LLD mat文件提取ISO失败: {mat_path}, 错误: {e}")
         
         return None
     
     def get_lld_dark_frame(self, iso, image_shape):
         """
         获取LLD暗帧数据用于噪声合成
-        
-        Args:
-            iso: 目标ISO值
-            image_shape: 目标图像尺寸 (H, W)
-        
-        Returns:
-            dark_frame: 暗帧数据，如果不可用则返回None
         """
         if not self.use_lld_dark_frames or iso not in self.lld_dark_frames:
             return None
         
-        # 随机选择一个暗帧文件
         dark_frame_files = self.lld_dark_frames[iso]
         if not dark_frame_files:
             return None
@@ -159,16 +152,31 @@ class Enhanced_SID_Dataset(SID_Dataset):
         selected_file = np.random.choice(dark_frame_files)
         
         try:
-            # 使用项目现有的dataload函数
-            dark_frame = dataload(selected_file)
+            # 使用scipy直接加载LLD的mat文件
+            import scipy.io as sio
+            mat_data = sio.loadmat(selected_file)
             
-            # 调整尺寸以匹配目标图像
-            if dark_frame.shape != image_shape:
-                dark_frame = self._resize_dark_frame(dark_frame, image_shape)
-            
-            return dark_frame
+            if 'Inoisy_crop' in mat_data:
+                dark_frame = mat_data['Inoisy_crop'].astype(np.float32)
+                
+                # 验证ISO匹配
+                if 'ISO' in mat_data:
+                    file_iso = int(mat_data['ISO'].item() if hasattr(mat_data['ISO'], 'item') else mat_data['ISO'])
+                    if file_iso != iso:
+                        log(f"警告: 文件ISO({file_iso})与请求ISO({iso})不匹配: {selected_file}")
+                
+                # 验证尺寸匹配 (2848×4256 应该与PMN期望尺寸匹配)
+                if dark_frame.shape != image_shape:
+                    log(f"LLD暗帧尺寸 {dark_frame.shape} 与目标尺寸 {image_shape} 不匹配，进行调整")
+                    dark_frame = self._resize_dark_frame(dark_frame, image_shape)
+                
+                return dark_frame
+            else:
+                log(f"警告: LLD mat文件中未找到'Inoisy_crop'键: {selected_file}")
+                return None
+                
         except Exception as e:
-            log(f"加载暗帧文件 {selected_file} 失败: {e}")
+            log(f"加载LLD暗帧文件 {selected_file} 失败: {e}")
             return None
     
     def _resize_dark_frame(self, dark_frame, target_shape):
