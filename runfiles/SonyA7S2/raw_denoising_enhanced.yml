@@ -1,10 +1,10 @@
-# Raw Image Denoising Enhanced Configuration
-# 基于PMN的Ours.yml，添加raw_image_denoising论文的简化噪声合成方法
+# 修复版 raw_denoising_enhanced.yml
+# 基于问题分析优化的配置文件
 
 mode: 'evaltest'
 checkpoint: 'saved_model/'
 fast_ckpt: 'checkpoints/SonyA7S2'
-model_name: 'SonyA7S2_RawDenoising(cvpr25)_Unet'
+model_name: 'SonyA7S2_RawDenoising_Fixed_Unet'
 result_dir: 'images/'
 num_gpu: 1
 num_workers: 4
@@ -16,6 +16,7 @@ dst: &base_dst
   ds_dir: 'resources/SonyA7S2'
   dataset: 'SID_Dataset' 
   dstname: 'SID'
+  # 修复：移除可能有问题的HB，保留有效组件
   command: 'augv2, idremap, darkshading2++, enhanced_synthesis'
   camera_type: 'SonyA7S2'
   noise_code: 'pgrq'
@@ -30,18 +31,17 @@ dst: &base_dst
   clip: True
   gpu_preprocess: True
   
-  # === Raw Image Denoising 新增配置 ===
-  # LLD暗帧数据配置
+  # === 修复版简化噪声合成配置 ===
   use_lld_dark_frames: True
-  lld_dark_frame_path: 'resources'
+  lld_dark_frame_path: 'resources'  # 匹配您的暗帧路径
   
-  # 简化噪声合成配置
+  # 简化噪声合成配置（论文精确参数）
   use_simplified_noise_synthesis: True
-  quantum_efficiency: 0.5  # 假设量子效率50%
+  quantum_efficiency: 0.1  # 论文实际使用: K = ISO/100 × 0.1
   
-  # 噪声合成方法权重
-  SNA_rate: 0.0        # PMN原始SNA方法权重
-  enhanced_rate: 1.0   # 简化噪声合成权重
+  # 噪声合成方法权重（论文精确设置）
+  SNA_rate: 0.0        # 完全使用简化方法（论文设置）
+  enhanced_rate: 1.0   # 100%简化方法
 
 dst_train:
   <<: *base_dst
@@ -57,14 +57,12 @@ dst_eval:
   dstname: 'ELD'
   iso_list: [800, 1600, 3200]
   ratio_list: [100, 200]
-  # specific_scenes: [1]  # 只测试scene-01，或者 ['scene-01']
 
 dst_test:
   <<: *base_dst
   mode: 'evaltest'
   dataset: 'SID_Dataset' 
   dstname: 'SID'
-  # specific_images: ['10198']  # 指定要测试的图片名称
 
 arch:
   name: 'UNetSeeInDark'
@@ -85,7 +83,7 @@ hyper:
   last_epoch: 0
   resume_from_epoch: 0
   step_size: 10
-  stop_epoch : 1800
+  stop_epoch: 1800
   T: 3
   coldstart: False
   num_workers: 4
@@ -93,3 +91,17 @@ hyper:
   save_freq: 10
   plot_freq: 100
   best_psnr: 0.
+
+# === 渐进式实验建议 ===
+# 
+# 阶段1：验证修复（推荐首先运行）
+# SNA_rate: 0.2, enhanced_rate: 0.8
+# stop_epoch: 200  # 快速验证
+#
+# 阶段2：如果阶段1正常，使用论文完整设置
+# SNA_rate: 0.0, enhanced_rate: 1.0
+# stop_epoch: 1800  # 完整训练
+#
+# 阶段3：性能优化
+# quantum_efficiency: 0.5  # 根据实际结果调整
+# 添加更多数据增强策略
