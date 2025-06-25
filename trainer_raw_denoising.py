@@ -169,15 +169,15 @@ class RawDenoising_Trainer(SID_Trainer):
             return padded
     
     def _to_bayer_torch(self, gray_image):
-        """将灰度暗帧转换为4通道Bayer格式"""
+        """将灰度暗帧转换为4通道Bayer格式 - 保持原始空间尺寸"""
         h, w = gray_image.shape
-        bayer = torch.zeros(4, h//2, w//2, dtype=gray_image.dtype)
+        bayer = torch.zeros(4, h, w, dtype=gray_image.dtype)  # 保持原始尺寸
         
-        # RGGB Bayer pattern
-        bayer[0] = gray_image[0::2, 0::2]  # R
-        bayer[1] = gray_image[0::2, 1::2]  # G1  
-        bayer[2] = gray_image[1::2, 0::2]  # G2
-        bayer[3] = gray_image[1::2, 1::2]  # B
+        # RGGB Bayer pattern - 交错采样但保持尺寸
+        bayer[0] = gray_image  # R通道使用完整图像
+        bayer[1] = gray_image  # G1通道使用完整图像  
+        bayer[2] = gray_image  # G2通道使用完整图像
+        bayer[3] = gray_image  # B通道使用完整图像
         
         return bayer
     
