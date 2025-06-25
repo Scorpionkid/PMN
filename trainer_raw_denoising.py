@@ -1,6 +1,8 @@
+#!/usr/bin/env python3
 """
-修复版 Raw Image Denoising Trainer
-解决简化噪声合成与PMN接口不匹配的问题
+完整版 Raw Image Denoising Trainer
+基于PMN框架集成raw_image_denoising的噪声合成方法
+包含完整的训练启动逻辑
 """
 
 import os
@@ -8,6 +10,7 @@ import time
 import torch
 import numpy as np
 import pickle as pkl
+import scipy.io as sio
 from torch.utils.data import DataLoader
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
@@ -41,7 +44,8 @@ class RawDenoising_Trainer(SID_Trainer):
         dst_config = self.dst
         self.use_hypothesized_gain = dst_config.get('use_simplified_noise_synthesis', True)
         self.use_simplified_noise_synthesis = dst_config.get('use_simplified_noise_synthesis', True)
-        self.quantum_efficiency = dst_config.get('quantum_efficiency', 0.4)
+        # 使用论文精确参数：K = ISO/100 × 0.1
+        self.quantum_efficiency = dst_config.get('quantum_efficiency', 0.1)
         
         # 噪声合成权重
         self.sna_rate = dst_config.get('SNA_rate', 0.5)
@@ -62,38 +66,54 @@ class RawDenoising_Trainer(SID_Trainer):
     
     def simplified_noise_synthesis_pmn_compatible(self, clean_image, iso, ratio, dark_frame_paths=None):
         """
-        PMN兼容的简化噪声合成方法 - 论文精确实现
-        基于论文公式：Ka(X + Np) ~ Ka × Poisson(I/Ka)
-        返回与SNA_torch相同格式的增量：(dn, dy, noise_params)
+        修复版：正确的简化噪声合成公式
+        
+        物理过程：原始信号 → 光子噪声 → 系统增益放大 → 信号无关噪声 → 数字增益
+        论文公式：D = Kd * (Ka(X + Np) + N2)
+        其中：Kd是数字增益(ratio), Ka是系统增益, X是原始信号, Np是光子噪声, N2是信号无关噪声
         """
         # 论文精确参数：K = ISO/100 × 0.1
-        system_gain = iso / 100.0 * 0.1
+        system_gain = iso / 100.0 * 0.1  # Ka
         
-        # 步骤1：计算放大的清洁图像 (应用数字增益)
-        scaled_clean = clean_image * ratio
+        # 步骤1：基于原始信号计算光子散粒噪声 (不提前应用数字增益!)
+        signal_for_poisson = torch.clamp(clean_image / system_gain, min=1e-6, max=1e6)
         
-        # 步骤2：合成光子散粒噪声 Ka(X + Np) ~ Ka × Poisson(I/Ka)
-        # 这里I = scaled_clean就是放大后的图像强度
-        signal_for_poisson = torch.clamp(scaled_clean / system_gain, min=1e-6)
+        # 步骤2：生成泊松光子噪声
+        try:
+            poisson_samples = torch.poisson(signal_for_poisson)
+            if torch.any(torch.isnan(poisson_samples)) or torch.any(torch.isinf(poisson_samples)):
+                raise RuntimeError("Invalid poisson samples")
+        except RuntimeError:
+            # 回退到高斯近似
+            poisson_samples = torch.normal(
+                mean=signal_for_poisson,
+                std=torch.sqrt(torch.clamp(signal_for_poisson, min=1e-6))
+            )
         
-        # 生成泊松噪声并放大
-        poisson_samples = torch.poisson(signal_for_poisson)
-        photon_noise_component = poisson_samples * system_gain
+        # 步骤3：应用系统增益 Ka(X + Np)
+        signal_with_photon_noise = poisson_samples * system_gain
         
-        # 步骤3：添加信号无关噪声（直接暗帧采样）
+        # 步骤4：添加信号无关噪声 N2
         signal_independent_noise = self.get_signal_independent_noise_torch(
             clean_image.shape, iso, dark_frame_paths
         )
         
-        # 步骤4：合成最终带噪图像
-        # 论文公式：D = Ka(X + Np) + 信号无关噪声
-        final_noisy = photon_noise_component + signal_independent_noise
+        # 步骤5：传感器输出 = Ka(X + Np) + N2
+        sensor_output = signal_with_photon_noise + signal_independent_noise
         
-        # 计算增量，与PMN的SNA_torch接口一致
-        dn = final_noisy - scaled_clean     # 噪声增量
+        # 步骤6：最后应用数字增益 D = Kd * (Ka(X + Np) + N2)
+        final_noisy = sensor_output * ratio
+        
+        # 步骤7：计算增量，与PMN接口一致
+        # PMN期望：imgs_lr = imgs_lr + dn, imgs_hr = imgs_hr + dy
+        scaled_clean = clean_image * ratio  # 放大的清洁图像
+        dn = final_noisy - scaled_clean     # 总噪声增量
         dy = scaled_clean - clean_image     # 清洁图像增量（数字增益效果）
         
-        # 噪声参数（模拟PMN格式）
+        # 数值安全检查
+        dn = torch.clamp(dn, min=-1e4, max=1e4)
+        
+        # 噪声参数
         noise_params = torch.tensor([iso, ratio], device=self.device)
         
         return dn, dy, noise_params
@@ -108,11 +128,25 @@ class RawDenoising_Trainer(SID_Trainer):
             
             try:
                 # 加载.mat文件中的暗帧
-                import scipy.io as sio
                 mat_data = sio.loadmat(selected_file)
                 
                 if 'Inoisy_crop' in mat_data:
                     dark_frame = mat_data['Inoisy_crop'].astype(np.float32)
+                    # === 关键修复：暗帧缩放处理 ===
+                    # 步骤1：归一化 - 去除直流分量
+                    dark_frame_mean = np.mean(dark_frame)
+                    dark_frame_normalized = dark_frame - dark_frame_mean
+                    
+                    # 步骤2：大幅缩放到合理水平
+                    # 目标：最终暗帧噪声在合理范围内
+                    current_max = np.max(np.abs(dark_frame_normalized))
+                    target_max_before_ratio = 0.2  # 目标：ratio前±0.2
+                    scaling_factor = target_max_before_ratio / current_max if current_max > 0 else 1.0
+                    
+                    dark_frame_scaled = dark_frame_normalized * scaling_factor
+                    
+                    # print(f"DEBUG 暗帧缩放: 原始范围±{current_max:.1f} → 缩放因子{scaling_factor:.6f} → 最终范围±{np.max(np.abs(dark_frame_scaled)):.3f}")
+                    # === 缩放修复结束 ===
                     
                     # 调整尺寸匹配
                     if len(image_shape) == 4:  # batch, channel, height, width
@@ -121,7 +155,7 @@ class RawDenoising_Trainer(SID_Trainer):
                         target_shape = image_shape[1:]
                     
                     # 调整暗帧尺寸
-                    dark_frame_resized = self._resize_dark_frame_torch(dark_frame, target_shape)
+                    dark_frame_resized = self._resize_dark_frame_torch(dark_frame_scaled, target_shape)
                     
                     # 转换为正确的通道格式 (从HW变为CHW或BCHW)
                     if len(image_shape) == 4:  # batch
@@ -392,10 +426,70 @@ class LLD_DarkFrameLoader:
             log(f"扫描LLD暗帧数据时出错: {e}")
 
 
-# 测试函数
+# 完整的训练启动逻辑（与trainer_SID.py保持一致）
 if __name__ == '__main__':
-    print("修复版 Raw Image Denoising Trainer")
-    print("主要修复：")
-    print("1. 简化噪声合成与PMN接口一致性")
-    print("2. 正确的增量式噪声应用")
-    print("3. 数据流处理逻辑修复")
+    print("Raw Image Denoising Trainer")
+    print("=" * 50)
+    
+    trainer = RawDenoising_Trainer()
+    # trainer.debug_dark_frame_values()
+    
+    if trainer.mode == 'train':
+        trainer.train()
+        savefile = os.path.join(trainer.sample_dir, f'{trainer.model_name}_train_psnr.jpg')
+        logfile = os.path.join(trainer.sample_dir, f'{trainer.model_name}_train_psnr.pkl')
+        trainer.train_psnr.plot_history(savefile=savefile, logfile=logfile)
+        trainer.eval_psnr.plot_history(savefile=os.path.join(trainer.sample_dir, f'{trainer.model_name}_eval_psnr.jpg'))
+        trainer.mode = 'evaltest'
+    
+    # 加载最佳模型
+    best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
+    if os.path.exists(best_model_path) is False: 
+        best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
+    
+    if os.path.exists(best_model_path):
+        best_model = torch.load(best_model_path, map_location=trainer.device)
+
+        # 检查加载的文件是新格式还是旧格式
+        if isinstance(best_model, dict) and 'model' in best_model:
+            # 新格式：包含完整训练状态
+            model_weights = best_model['model']
+            log(f"加载新格式模型权重用于评估")
+            log(f"Epoch{best_model['epoch']}, Best_PSNR{best_model['best_psnr']}")
+        else:
+            # 旧格式：仅包含模型权重
+            model_weights = best_model
+            log(f"加载旧格式模型权重用于评估")
+
+        trainer.net = load_weights(trainer.net, model_weights, multi_gpu=trainer.multi_gpu)
+        
+        if 'eval' in trainer.mode:
+            # ELD评估
+            trainer.change_eval_dst('eval')
+            for dgain in trainer.args['dst_eval']['ratio_list']:
+                info_path = os.path.join(trainer.cache_dir, f'{trainer.dstname}_{dgain}.pkl')
+                if os.path.exists(info_path):
+                    with open(info_path,'rb') as f:
+                        trainer.infos = pkl.load(f)
+                log(f'ELD Datasets: Dgain={dgain}',log=f'./logs/log_{trainer.model_name}.log')
+                trainer.dst_eval.ratio_list=[dgain]
+                trainer.dst_eval.recheck_length()
+                metrics = trainer.eval(-1)
+
+        if 'test' in trainer.mode:
+            # SID评估
+            trainer.change_eval_dst('test')
+            SID_ratio_list = [100, 250, 300]
+            for dgain in SID_ratio_list:
+                info_path = os.path.join(trainer.cache_dir, f'{trainer.dstname}_{dgain}.pkl')
+                if os.path.exists(info_path):
+                    with open(info_path,'rb') as f:
+                        trainer.infos = pkl.load(f)
+                log(f'SID Datasets: Dgain={dgain}',log=f'./logs/log_{trainer.model_name}.log')
+                trainer.dst_eval.change_eval_ratio(ratio=dgain)
+                metrics = trainer.eval(-1)
+        
+        log(f'Metrics have been saved in ./metrics/{trainer.model_name}_metrics.pkl')
+    else:
+        log(f"未找到训练好的模型: {best_model_path}")
+        log("如果是首次训练，请确保训练模式设置正确")
