@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional, Dict, List
-from utils.basic_utils import log
+from utils import *
 from data_process.process import SNA_torch  # PMN原有的SNA方法
 
 
@@ -37,7 +37,7 @@ class TorchSimplifiedNoiseSynthesis:
         self.dark_frame_cache = {}
         self.max_cache_size = 50  # 限制GPU内存使用
         
-        log(f"PyTorch简化噪声合成器初始化完成，设备: {device}")
+        # log(f"PyTorch简化噪声合成器初始化完成，设备: {device}")
     
     def hypothesize_system_gain(self, iso: torch.Tensor) -> torch.Tensor:
         """
@@ -66,7 +66,7 @@ class TorchSimplifiedNoiseSynthesis:
         
         # 生成均匀分布的随机增益
         random_factor = torch.rand_like(nominal_gain, device=self.device) * 2 - 1  # [-1, 1]
-        random_gain = nominal_gain + random_facator * variance
+        random_gain = nominal_gain + random_factor * variance
         
         return torch.clamp(random_gain, min=0.01)  # 确保增益为正
     
@@ -101,15 +101,32 @@ class TorchSimplifiedNoiseSynthesis:
     
     def load_dark_frame_tensor(self, dark_frame_path: str, target_shape: Tuple[int, int]) -> Optional[torch.Tensor]:
         """
-        加载暗帧并转换为PyTorch张量
+        加载暗帧并转换为PyTorch张量（添加归一化处理）
         """
         try:
-            from data_process.process import dataload
+            from data_process.process import dataload, raw2bayer
             dark_frame = dataload(dark_frame_path)
             
             # 转换为numpy
             if torch.is_tensor(dark_frame):
                 dark_frame = dark_frame.cpu().numpy()
+            
+            # ⭐ 关键修复：对暗帧进行归一化处理
+            # 使用与正常图像相同的归一化参数
+            if dark_frame.ndim == 2:  # 如果是2D RAW图像
+                # 应用与PMN相同的归一化
+                wp, bl = 16383, 512  # SonyA7S2参数，从配置读取更好
+                dark_frame_4c = raw2bayer(dark_frame, wp=wp, bl=bl, norm=True, clip=False)
+                # 取均值作为单通道暗帧噪声
+                dark_frame = np.mean(dark_frame_4c, axis=0)
+            elif dark_frame.ndim == 3 and dark_frame.shape[0] == 4:  # 如果已经是4通道
+                # 如果数值范围还是RAW域，需要归一化
+                if dark_frame.max() > 10:
+                    wp, bl = 16383, 512
+                    dark_frame = (dark_frame - bl) / (wp - bl)
+                    dark_frame = np.clip(dark_frame, 0, 1)
+                # 取均值作为单通道
+                dark_frame = np.mean(dark_frame, axis=0)
             
             # 调整尺寸
             dark_frame = self._resize_frame_numpy(dark_frame, target_shape)
@@ -323,7 +340,7 @@ class EnhancedSNA_torch:
                 clean_image = clean_image.unsqueeze(0)  # 添加batch维度
             
             noisy_batch = self.simplified_synthesizer.synthesize_batch_noise(
-                clean_image, [iso], [ratio], dark_frame_paths, use_random_gain=True
+                clean_image, [iso], [ratio], dark_frame_paths, use_random_gain=False
             )
             return noisy_batch.squeeze(0)  # 移除batch维度
             
@@ -475,7 +492,7 @@ if __name__ == '__main__':
     single_image = clean_images[0]
     aug_wb = np.array([0.1, 0.0, -0.1, 0.0])
     
-    enhanced_result = enhanced_sna.enhanced_synthesis(
+    enhanced_result = enhanced_sna. enhanced_synthesis(
         single_image, iso_list[0], ratio_list[0], aug_wb, use_method='simplified'
     )
     

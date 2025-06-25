@@ -263,7 +263,11 @@ class RawDenoising_Trainer(SID_Trainer):
                 # 保持与原有SNA的兼容性
                 return super().preprocess(data, mode, preprocess)
         
-        ratio = data['ratio'] if 'ratio' in data else torch.ones(b)
+        ratio = data['ratio'].type(torch.FloatTensor).to(self.device)
+        ratio = ratio.view(-1,1,1,1)
+        if 'rgb_gain' in data:
+            data['rgb_gain'] = data['rgb_gain'].type(torch.FloatTensor).to(self.device).view_as(ratio)
+        
         return imgs_lr, imgs_hr, ratio, noise_map
     
     def get_synthesis_method(self):
@@ -308,7 +312,7 @@ class RawDenoising_Trainer(SID_Trainer):
         
         # 批量合成噪声
         noisy_images = synthesizer.synthesize_batch_noise(
-            clean_images, iso_list, ratio_list, dark_frame_paths, use_random_gain=True
+            clean_images, iso_list, ratio_list, dark_frame_paths, use_random_gain=False
         )
         
         return noisy_images
@@ -340,12 +344,11 @@ class LLD_DarkFrameLoader:
         
         # 扫描LLD目录结构，查找暗帧文件
         # LLD数据集通常包含~400 dark frames per ISO, 24个ISO级别
-        bias_dirs = ['bias', 'dark_frames', 'calibration']
+        bias_dir = 'SonyA7S2/BiasFrame_ET_1_30'
         
-        for bias_dir in bias_dirs:
-            bias_path = os.path.join(self.lld_path, bias_dir)
-            if os.path.exists(bias_path):
-                self._scan_bias_directory(bias_path)
+        bias_path = os.path.join(self.lld_path, bias_dir)
+        if os.path.exists(bias_path):
+            self._scan_bias_directory(bias_path)
         
         self.available_isos = sorted(list(set(self.available_isos)))
         log(f"发现LLD暗帧数据，支持的ISO: {self.available_isos}")
@@ -371,7 +374,7 @@ class LLD_DarkFrameLoader:
                     if dark_frame_files:
                         self.dark_frame_paths[iso] = dark_frame_files
                         self.available_isos.append(iso)
-                        log(f"为ISO {iso} 找到 {len(dark_frame_files)} 个暗帧文件")
+                        # log(f"为ISO {iso} 找到 {len(dark_frame_files)} 个暗帧文件")
                         
                 elif item.endswith('.mat'):
                     # 直接的.mat文件，尝试从文件名提取ISO

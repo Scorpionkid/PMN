@@ -12,7 +12,7 @@ brightness_correct: True
 
 dst: &base_dst
   root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/SID'
-  bias_dir: 'resources'
+  bias_dir: 'resources/SonyA7S2/BiasFrame_ET_1_30'
   ds_dir: 'resources/SonyA7S2'
   dataset: 'SID_Dataset' 
   dstname: 'SID'
@@ -37,7 +37,7 @@ dst: &base_dst
   
   # 简化噪声合成配置
   use_simplified_noise_synthesis: True
-  quantum_efficiency: 0.5  # 假设量子效率40%
+  quantum_efficiency: 0.5  # 假设量子效率50%
   
   # 噪声合成方法权重
   SNA_rate: 0.0        # PMN原始SNA方法权重
