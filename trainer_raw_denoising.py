@@ -95,7 +95,7 @@ class RawDenoising_Trainer(SID_Trainer):
         
         # 步骤4：添加信号无关噪声 N2
         signal_independent_noise = self.get_signal_independent_noise_torch(
-            clean_image.shape, iso, dark_frame_paths
+            clean_image.shape, iso, dark_frame_paths, ratio=ratio
         )
         
         # 步骤5：传感器输出 = Ka(X + Np) + N2
@@ -118,7 +118,7 @@ class RawDenoising_Trainer(SID_Trainer):
         
         return dn, dy, noise_params
     
-    def get_signal_independent_noise_torch(self, image_shape, iso, dark_frame_paths=None):
+    def get_signal_independent_noise_torch(self, image_shape, iso, dark_frame_paths=None, ratio=None):
         """
         获取信号无关噪声 - 直接暗帧采样（论文核心创新）
         """
@@ -132,18 +132,26 @@ class RawDenoising_Trainer(SID_Trainer):
                 
                 if 'Inoisy_crop' in mat_data:
                     dark_frame = mat_data['Inoisy_crop'].astype(np.float32)
-                    # === 关键修复：暗帧缩放处理 ===
+                    
+                    if dark_frame.max() > 10:  # 检查是否在RAW域
+                        wp, bl = 16383, 512  # SonyA7S2参数
+                        dark_frame_4c = raw2bayer(dark_frame, wp=wp, bl=bl, norm=True, clip=False)
+                        # 取均值作为单通道暗帧噪声
+                        dark_frame = np.mean(dark_frame_4c, axis=0)
+
                     # 步骤1：归一化 - 去除直流分量
                     dark_frame_mean = np.mean(dark_frame)
                     dark_frame_normalized = dark_frame - dark_frame_mean
                     
                     # 步骤2：大幅缩放到合理水平
                     # 目标：最终暗帧噪声在合理范围内
-                    current_max = np.max(np.abs(dark_frame_normalized))
-                    target_max_before_ratio = 0.2  # 目标：ratio前±0.2
-                    scaling_factor = target_max_before_ratio / current_max if current_max > 0 else 1.0
+                    # current_max = np.max(np.abs(dark_frame_normalized))
+                    # base_target = 0.2  # 基准目标 (ratio=100时)
+                    # gain_factor = max(ratio / 100.0, 1.0)  # 增益因子
+                    # ratio_adjusted_target = base_target / np.sqrt(gain_factor)  # 高增益下更小的噪声
+                    # scaling_factor = ratio_adjusted_target / current_max if current_max > 0 else 1.0
                     
-                    dark_frame_scaled = dark_frame_normalized * scaling_factor
+                    # dark_frame_scaled = dark_frame_normalized * scaling_factor
                     
                     # print(f"DEBUG 暗帧缩放: 原始范围±{current_max:.1f} → 缩放因子{scaling_factor:.6f} → 最终范围±{np.max(np.abs(dark_frame_scaled)):.3f}")
                     # === 缩放修复结束 ===
@@ -155,7 +163,7 @@ class RawDenoising_Trainer(SID_Trainer):
                         target_shape = image_shape[1:]
                     
                     # 调整暗帧尺寸
-                    dark_frame_resized = self._resize_dark_frame_torch(dark_frame_scaled, target_shape)
+                    dark_frame_resized = self._resize_dark_frame_torch(dark_frame_normalized, target_shape)
                     
                     # 转换为正确的通道格式 (从HW变为CHW或BCHW)
                     if len(image_shape) == 4:  # batch
