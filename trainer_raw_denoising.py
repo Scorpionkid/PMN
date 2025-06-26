@@ -72,11 +72,25 @@ class RawDenoising_Trainer(SID_Trainer):
         论文公式：D = Kd * (Ka(X + Np) + N2)
         其中：Kd是数字增益(ratio), Ka是系统增益, X是原始信号, Np是光子噪声, N2是信号无关噪声
         """
-        # 论文精确参数：K = ISO/100 × 0.1
-        system_gain = iso / 100.0 * 0.1  # Ka
+        device = clean_image.device
+    
+        # 🔧 关键修复1: 借鉴SNA的域转换策略
+        # 获取相机参数（从配置中读取，或使用默认值）
+        wp = torch.tensor(getattr(self.dst, 'wp', 16383), dtype=clean_image.dtype, device=device)
+        bl = torch.tensor(getattr(self.dst, 'bl', 512), dtype=clean_image.dtype, device=device)
         
-        # 步骤1：基于原始信号计算光子散粒噪声 (不提前应用数字增益!)
-        signal_for_poisson = torch.clamp(clean_image / system_gain, min=1e-6, max=1e6)
+        if not torch.is_tensor(ratio):
+            ratio = torch.tensor(ratio, dtype=clean_image.dtype, device=device)
+        # 🔧 关键修复2: 转换到RAW域进行处理（类似SNA_torch）
+        # 将归一化的clean_image转换到RAW域
+        clean_raw = clean_image * (wp - bl) / ratio
+        
+        # 论文精确参数：K = ISO/100 × 0.1 - Ka是物理参数，不应该调整！
+        system_gain = iso / 100.0 * self.quantum_efficiency  # Ka保持不变
+        
+        # 步骤1：基于RAW域信号计算光子散粒噪声
+        # 在RAW域，signal_for_poisson的数值会自然增大到合理范围
+        signal_for_poisson = torch.clamp(clean_raw / system_gain, min=1.0, max=50000.0)
         
         # 步骤2：生成泊松光子噪声
         try:
@@ -94,21 +108,26 @@ class RawDenoising_Trainer(SID_Trainer):
         signal_with_photon_noise = poisson_samples * system_gain
         
         # 步骤4：添加信号无关噪声 N2
-        signal_independent_noise = self.get_signal_independent_noise_torch(
-            clean_image.shape, iso, dark_frame_paths, ratio=ratio
+        signal_independent_noise_raw = self.get_signal_independent_noise_torch(
+            clean_image.shape, iso, dark_frame_paths, wp, bl
         )
         
-        # 步骤5：传感器输出 = Ka(X + Np) + N2
-        sensor_output = signal_with_photon_noise + signal_independent_noise
+
         
-        # 步骤6：最后应用数字增益 D = Kd * (Ka(X + Np) + N2)
-        final_noisy = sensor_output * ratio
+        # 步骤5：在RAW域合成总噪声
+        total_noise_raw = signal_with_photon_noise + signal_independent_noise_raw
+        
+        # 步骤6：应用数字增益（在RAW域）
+        final_noisy_raw = clean_raw + total_noise_raw
+        
+        # 🔧 关键修复3: 转换回归一化域（类似SNA_torch的处理）
+        # 将RAW域的结果转换回归一化域
+        final_noisy_normalized = final_noisy_raw * ratio / (wp - bl)
+        scaled_clean_normalized = clean_raw * ratio / (wp - bl)
         
         # 步骤7：计算增量，与PMN接口一致
         # PMN期望：imgs_lr = imgs_lr + dn, imgs_hr = imgs_hr + dy
-        scaled_clean = clean_image * ratio  # 放大的清洁图像
-        dn = final_noisy - scaled_clean     # 总噪声增量
-        dy = scaled_clean - clean_image     # 清洁图像增量（数字增益效果）
+        dn = final_noisy_normalized - scaled_clean_normalized 
         
         # 数值安全检查
         dn = torch.clamp(dn, min=-1e4, max=1e4)
@@ -116,9 +135,9 @@ class RawDenoising_Trainer(SID_Trainer):
         # 噪声参数
         noise_params = torch.tensor([iso, ratio], device=self.device)
         
-        return dn, dy, noise_params
+        return dn, noise_params
     
-    def get_signal_independent_noise_torch(self, image_shape, iso, dark_frame_paths=None, ratio=None):
+    def get_signal_independent_noise_torch(self, image_shape, iso, dark_frame_paths, wp, bl):
         """
         获取信号无关噪声 - 直接暗帧采样（论文核心创新）
         """
@@ -131,30 +150,17 @@ class RawDenoising_Trainer(SID_Trainer):
                 mat_data = sio.loadmat(selected_file)
                 
                 if 'Inoisy_crop' in mat_data:
+                    # 保持数据为NumPy数组
                     dark_frame = mat_data['Inoisy_crop'].astype(np.float32)
-                    
-                    if dark_frame.max() > 10:  # 检查是否在RAW域
-                        wp, bl = 16383, 512  # SonyA7S2参数
-                        dark_frame_4c = raw2bayer(dark_frame, wp=wp, bl=bl, norm=True, clip=False)
-                        # 取均值作为单通道暗帧噪声
-                        dark_frame = np.mean(dark_frame_4c, axis=0)
 
-                    # 步骤1：归一化 - 去除直流分量
-                    dark_frame_mean = np.mean(dark_frame)
-                    dark_frame_normalized = dark_frame - dark_frame_mean
+                    # 🔧 关键修复：确保暗帧在RAW域
+                    if dark_frame.max() <= 2:  # 如果已经归一化了，转换回RAW域
+                        wp_np = wp.cpu().numpy()
+                        bl_np = bl.cpu().numpy()
+                        dark_frame = dark_frame * (wp_np - bl_np) + bl_np
                     
-                    # 步骤2：大幅缩放到合理水平
-                    # 目标：最终暗帧噪声在合理范围内
-                    # current_max = np.max(np.abs(dark_frame_normalized))
-                    # base_target = 0.2  # 基准目标 (ratio=100时)
-                    # gain_factor = max(ratio / 100.0, 1.0)  # 增益因子
-                    # ratio_adjusted_target = base_target / np.sqrt(gain_factor)  # 高增益下更小的噪声
-                    # scaling_factor = ratio_adjusted_target / current_max if current_max > 0 else 1.0
-                    
-                    # dark_frame_scaled = dark_frame_normalized * scaling_factor
-                    
-                    # print(f"DEBUG 暗帧缩放: 原始范围±{current_max:.1f} → 缩放因子{scaling_factor:.6f} → 最终范围±{np.max(np.abs(dark_frame_scaled)):.3f}")
-                    # === 缩放修复结束 ===
+                    # 转换为PyTorch张量
+                    dark_frame_tensor = torch.from_numpy(dark_frame).to(self.device)
                     
                     # 调整尺寸匹配
                     if len(image_shape) == 4:  # batch, channel, height, width
@@ -162,25 +168,29 @@ class RawDenoising_Trainer(SID_Trainer):
                     else:  # channel, height, width
                         target_shape = image_shape[1:]
                     
-                    # 调整暗帧尺寸
-                    dark_frame_resized = self._resize_dark_frame_torch(dark_frame_normalized, target_shape)
+                    # 调整暗帧尺寸（确保返回张量）
+                    dark_frame_resized = self._resize_dark_frame_torch(dark_frame_tensor, target_shape)
                     
+                    # 步骤1：归一化 - 去除直流分量
+                    dark_frame_mean = dark_frame_resized.mean()  # 使用张量的mean方法
+                    dark_frame_normalized = dark_frame_resized - dark_frame_mean  # 对张量进行操作
+                
                     # 转换为正确的通道格式 (从HW变为CHW或BCHW)
                     if len(image_shape) == 4:  # batch
                         channels = image_shape[1]
                         if channels == 4:  # Bayer pattern
-                            dark_frame_bayer = self._to_bayer_torch(dark_frame_resized)
+                            dark_frame_bayer = self._to_bayer_torch(dark_frame_normalized)
                         else:
-                            dark_frame_bayer = dark_frame_resized.unsqueeze(0).repeat(channels, 1, 1)
-                        dark_frame_tensor = dark_frame_bayer.unsqueeze(0)  # Add batch dim
+                            dark_frame_bayer = dark_frame_normalized.unsqueeze(0).repeat(channels, 1, 1)
+                        dark_frame_output = dark_frame_bayer.unsqueeze(0)  # Add batch dim
                     else:  # single image
                         channels = image_shape[0]
                         if channels == 4:  # Bayer pattern
-                            dark_frame_tensor = self._to_bayer_torch(dark_frame_resized)
+                            dark_frame_output = self._to_bayer_torch(dark_frame_normalized)
                         else:
-                            dark_frame_tensor = dark_frame_resized.unsqueeze(0).repeat(channels, 1, 1)
+                            dark_frame_output = dark_frame_normalized.unsqueeze(0).repeat(channels, 1, 1)
                     
-                    return dark_frame_tensor.to(self.device)
+                    return dark_frame_output.to(self.device)
                 
             except Exception as e:
                 log(f"暗帧加载失败 {selected_file}: {e}")
@@ -190,7 +200,7 @@ class RawDenoising_Trainer(SID_Trainer):
     
     def _resize_dark_frame_torch(self, dark_frame, target_shape):
         """使用PyTorch调整暗帧尺寸"""
-        dark_tensor = torch.from_numpy(dark_frame).float()
+        dark_tensor = dark_frame
         h, w = target_shape
         fh, fw = dark_tensor.shape
         
@@ -241,7 +251,7 @@ class RawDenoising_Trainer(SID_Trainer):
         for i in range(b):
             # 只对有效的白平衡增强参数进行处理（与PMN逻辑一致）
             if np.abs(aug_wb_list[i]).max() != 0:
-                dn, dy, p = self.simplified_noise_synthesis_pmn_compatible(
+                dn, p = self.simplified_noise_synthesis_pmn_compatible(
                     clean_images[i], 
                     iso=iso_list[i], 
                     ratio=ratio_list[i],
@@ -249,7 +259,7 @@ class RawDenoising_Trainer(SID_Trainer):
                 )
                 
                 # 与PMN相同的增量应用方式
-                clean_images[i] = clean_images[i] + dy  # 更新清洁图像
+                # clean_images[i] = clean_images[i] + dy  # 更新清洁图像
                 # 注意：这里不直接修改imgs_lr，而是返回噪声增量
                 yield i, dn  # 返回索引和噪声增量
 
