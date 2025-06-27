@@ -70,7 +70,10 @@ class SID_Trainer(Base_Trainer):
             self.PBNetloss = PBNetLoss(camera_type=self.dst.get('camera_type', 'SonyA7S2'))
 
             # 初始化监控器
-            self.physics_monitor = SimplePhysicsMonitor(model_name=self.model_name)
+            self.physics_monitor = SimplePhysicsMonitor(
+                model_name=self.model_name, 
+                log_file=f'./logs/{self.model_name}_physics.log'  # 可选，不指定会用默认路径
+            )
 
         else:
             self.l1loss = Unet_Loss()
@@ -177,6 +180,29 @@ class SID_Trainer(Base_Trainer):
         
         # 设置信号处理
         # self.setup_signal_handler()
+
+    # 在您的类中添加
+    def debug_dark_frame_values(self):
+        """调试暗帧的实际数值范围"""
+        if self.lld_dark_frame_loader and self.lld_dark_frame_loader.dark_frame_paths:
+            available_isos = list(self.lld_dark_frame_loader.dark_frame_paths.keys())
+            if available_isos:
+                test_iso = available_isos[0]
+                selected_file = self.lld_dark_frame_loader.dark_frame_paths[test_iso][0]
+                
+                import scipy.io as sio
+                mat_data = sio.loadmat(selected_file)
+                dark_frame = mat_data['Inoisy_crop'].astype(np.float32)
+                
+                print(f"=== 暗帧原始数据 ===")
+                print(f"暗帧数值范围: [{dark_frame.min():.1f}, {dark_frame.max():.1f}]")
+                print(f"暗帧均值: {dark_frame.mean():.1f}")
+                print(f"暗帧标准差: {dark_frame.std():.1f}")
+                
+                # 测试归一化效果
+                normalized = dark_frame - dark_frame.mean()
+                print(f"归一化后范围: [{normalized.min():.1f}, {normalized.max():.1f}]")
+                print(f"乘以ratio=300后: [{normalized.min()*300:.1f}, {normalized.max()*300:.1f}]")
     
     def change_eval_dst(self, mode='eval'):
         self.dst = self.args[f'dst_{mode}']
@@ -321,8 +347,8 @@ class SID_Trainer(Base_Trainer):
             self.scheduler.step()
             lr = self.scheduler.get_last_lr()[0]
 
-            if 'PBNet' in self.arch['name']:
-                self.physics_monitor.epoch_summary(epoch, len(self.dataloader_train))
+            # if 'PBNet' in self.arch['name']:
+            #     self.physics_monitor.epoch_summary(epoch, len(self.dataloader_train))
 
             # 存储模型
             if epoch % self.hyper['save_freq'] == 0:
@@ -920,6 +946,7 @@ def MultiProcessPlot(imgs_lr, imgs_dn, imgs_hr, wb, ccm, name, save_plot, epoch,
     return psnr, ssim
 
 
+
 if __name__ == '__main__':
     trainer = SID_Trainer()
     if trainer.mode == 'train':
@@ -930,9 +957,9 @@ if __name__ == '__main__':
         trainer.eval_psnr.plot_history(savefile=os.path.join(trainer.sample_dir, f'{trainer.model_name}_eval_psnr.jpg'))
         trainer.mode = 'evaltest'
     # best_model
-    best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
-    if os.path.exists(best_model_path) is False: 
-        best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
+    # best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
+    # if os.path.exists(best_model_path) is False: 
+    best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
     best_model = torch.load(best_model_path, map_location=trainer.device)
 
     # 检查加载的文件是新格式还是旧格式
