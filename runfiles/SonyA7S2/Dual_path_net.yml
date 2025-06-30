@@ -71,7 +71,7 @@ arch:
   dilated_rates: [1, 2, 4, 8]
   use_wavelet_upsample: True
   use_sharpness_recovery: True
-  use_noise_map: False
+  use_noise_map: True
   use_texture_detection: True
   enable_intermediate_supervision: True  
   use_depthwise_separable: True
