@@ -1,0 +1,96 @@
+mode: 'train'
+checkpoint: 'saved_model/'
+fast_ckpt: 'checkpoints/SonyA7S2'
+# 从您现有的模型开始微调
+pretrained_model: 'checkpoints/SonyA7S2/SonyA7S2_DualPathNet_last_model(1800epoch).pth'  # 您的预训练模型路径
+model_name: 'SonyA7S2_ELD_Finetune_12pairs'
+result_dir: 'images/'
+num_gpu: 1
+num_workers: 8
+brightness_correct: True
+
+dst: &base_dst 
+  root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/ELD/ELD'  # 您的ELD数据集路径
+  bias_dir: 'resources/SonyA7S2/BiasFrame_ET_1_30'
+  ds_dir: 'resources/SonyA7S2'
+  dataset: 'ELD_Train_Dataset'  # 使用新的ELD训练数据集类
+  dstname: 'ELD'
+  command: 'augv2, idremap, darkshading2++, HB, exactiso'  # 添加exactiso确保使用正确的ISO
+  camera_type: 'SonyA7S2'
+  noise_code: 'pgrq'
+  patch_size: 512
+  H: 2848
+  W: 4256
+  crop_per_image: 2  # 由于数据量少，增加每张图像的crop数量
+  croptype: 'non-overlapping'
+  wp: 16383
+  bl: 512
+  ori: False
+  clip: True
+  gpu_preprocess: True
+
+dst_train:
+  <<: *base_dst
+  mode: 'finetune'  # 使用finetune模式，对应12对数据
+  iso_list: [800, 1600, 3200]
+  ratio_list: [100, 200]
+
+# ✅ 正确的评估配置
+dst_eval:
+  mode: 'test'
+  crop_per_image: 0     # 不裁剪，使用完整图像
+  croptype: 'full_image' # 完整图像模式
+  patch_size: 0         # 不使用patch
+  
+dst_test:
+  mode: 'test'
+  crop_per_image: 0     # 不裁剪，使用完整图像  
+  croptype: 'full_image' # 完整图像模式
+  patch_size: 0         # 不使用patch
+
+# 使用与您原始模型相同的架构
+arch:
+  name: 'DPNet_E1'  # 与您的Dual_path_net.yml保持一致
+  in_channels: 4
+  out_channels: 4
+  nf: 48
+  use_dpsv: False
+  res: False
+  cascade: False
+  add: False
+  lock_wb: False
+  heads: [1, 2, 4, 8]
+  dilated_rates: [1, 2, 4, 8]
+  use_wavelet_upsample: True
+  use_sharpness_recovery: True
+  use_noise_map: True
+  use_texture_detection: True
+  enable_intermediate_supervision: True  
+  use_depthwise_separable: False
+
+loss:
+  perceptual: True  
+  gradient: True
+  multiloss: False    
+
+hyper:
+  lr_scheduler: 'WarmupCosine'
+  learning_rate: 1.e-5  # 微调使用较小的学习率
+  batch_size: 1
+  last_epoch: 0
+  step_size: 10
+  stop_epoch: 200  # 微调不需要太多epoch
+  T: 1
+  coldstart: False
+  num_workers: 8
+  num_gpus: 1
+  save_freq: 10
+  plot_freq: 50
+  best_psnr: 0.
+  
+# 微调特定设置
+finetune:
+  enabled: True
+  freeze_encoder: False  # 是否冻结编码器部分
+  freeze_bn: True       # 冻结BatchNorm层
+  weight_decay: 1.e-6   # 较小的权重衰减

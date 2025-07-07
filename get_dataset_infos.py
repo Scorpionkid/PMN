@@ -125,6 +125,99 @@ def get_ELD_info(info_dir='infos', root_dir='/data/ELD'):
         pkl.dump(infos, out_file)
     return infos
 
+def get_ELD_train_info(info_dir='info', root_dir='/data/ELD'):
+    """
+    为ELD数据集创建固定的训练/测试划分
+    基于原始get_ELD_info实现，但分离出微调和测试数据
+    """
+    import numpy as np
+    
+    def create_eld_info_original_style(scenes, root_dir, mode='finetune'):
+        """使用原始ELD的数据处理方式"""
+        camera_root = os.path.join(root_dir, 'SonyA7S2')
+        infos = []
+        ratio_list = [1, 1, 10, 100, 200]  # ELD原始的ratio设置
+        
+        for scene_num in scenes:
+            scene_name = f'scene-{scene_num}'  # 使用无前导零格式
+            path_scene = os.path.join(camera_root, scene_name)
+            
+            if not os.path.exists(path_scene):
+                print(f"警告: 场景目录不存在 {path_scene}")
+                continue
+                
+            infos_scene = []
+            for k in range(16):  # ELD每个场景有16张图像
+                path = os.path.join(path_scene, f'IMG_{k+1:04d}.ARW')
+                
+                if not os.path.exists(path):
+                    print(f"警告: 图像文件不存在 {path}")
+                    continue
+                    
+                try:
+                    # 使用原始的get_basic_info函数
+                    info = get_basic_info(path)
+                    info['ratio'] = ratio_list[k % 5]  # 按照原始逻辑分配ratio
+                    info['data'] = path
+                    infos_scene.append(info)
+                    
+                except Exception as e:
+                    print(f"处理 {path} 时出错: {e}")
+                    continue
+                    
+            if len(infos_scene) > 0:
+                infos.append(infos_scene)
+                print(f"成功处理场景 {scene_name}: {len(infos_scene)} 张图像")
+        
+        return infos
+    
+    # ELD数据集固定划分：
+    # 微调使用前2个场景 (scene-1, scene-2)
+    # 测试使用剩余8个场景 (scene-3 到 scene-10)
+    finetune_scenes = [1, 2]  # scene-1, scene-2
+    test_scenes = list(range(3, 11))  # scene-3 到 scene-10
+    
+    print(f"微调场景: {finetune_scenes}")
+    print(f"测试场景: {test_scenes}")
+    
+    # 创建微调集信息（使用原始ELD格式）
+    finetune_infos = create_eld_info_original_style(finetune_scenes, root_dir, 'finetune')
+    finetune_info_path = os.path.join(info_dir, "ELD_SonyA7S2_finetune.info")
+    with open(finetune_info_path, 'wb') as out_file:
+        pkl.dump(finetune_infos, out_file)
+    print(f"微调集信息已保存: {finetune_info_path}, 场景数: {len(finetune_infos)}")
+    
+    # 创建测试集信息（使用原始ELD格式）
+    test_infos = create_eld_info_original_style(test_scenes, root_dir, 'test')
+    test_info_path = os.path.join(info_dir, "ELD_SonyA7S2_test.info")
+    with open(test_info_path, 'wb') as out_file:
+        pkl.dump(test_infos, out_file)
+    print(f"测试集信息已保存: {test_info_path}, 场景数: {len(test_infos)}")
+    
+    # 统计信息
+    print(f"\n数据集划分统计:")
+    print(f"微调集: {len(finetune_infos)} 个场景")
+    print(f"测试集: {len(test_infos)} 个场景")
+    
+    # 计算总的图像对数（ratio=100和200的）
+    finetune_pairs = 0
+    test_pairs = 0
+    
+    for scene_info in finetune_infos:
+        for img_info in scene_info:
+            if img_info['ratio'] in [100, 200]:
+                finetune_pairs += 1
+                
+    for scene_info in test_infos:
+        for img_info in scene_info:
+            if img_info['ratio'] in [100, 200]:
+                test_pairs += 1
+                
+    print(f"微调用图像对数 (ratio=100,200): {finetune_pairs}")
+    print(f"测试用图像对数 (ratio=100,200): {test_pairs}")
+    
+    return finetune_infos, test_infos
+
 def get_IMX686_info_short(
         info_dir='infos', 
         root_dir='/data/LRID', 
@@ -209,7 +302,12 @@ if __name__ == "__main__":
     os.makedirs(args.info_dir, exist_ok=True)
     os.makedirs('worklog', exist_ok=True)
     if args.dstname == 'ELD':
-        infos = get_ELD_info(info_dir=args.info_dir, root_dir=args.root_dir)
+        if args.mode == 'finetune' or args.mode == 'train':
+            # 创建ELD微调/测试划分
+            finetune_infos, test_infos = get_ELD_train_info(info_dir=args.info_dir, root_dir=args.root_dir)
+        else:
+            # 原有的评估模式
+            infos = get_ELD_info(info_dir=args.info_dir, root_dir=args.root_dir)
     elif args.dstname == 'SID':
         if args.mode == 'evaltest':
             infos = get_SID_info_from_txt(info_dir=args.info_dir, root_dir=args.root_dir)
@@ -223,4 +321,3 @@ if __name__ == "__main__":
             infos = get_IMX686_info_short(info_dir=args.info_dir, root_dir=args.root_dir, subset=dir)
     print('Info Example:', infos[0])
     print()
-    
