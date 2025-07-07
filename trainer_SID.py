@@ -660,7 +660,7 @@ class SID_Trainer(Base_Trainer):
         noise_map = None
         if self.use_gpu and mode=='train' and preprocess:
             b = imgs_lr.shape[0]
-            if self.args['dst_train']['dataset'] == 'Mix_Dataset':
+            if self.args['dst_train']['dataset'] in ['Mix_Dataset', 'ELD_Train_Dataset']:
                 data['ratio'] = data['ratio'].view(-1).type(torch.FloatTensor).to(self.device)
                 aug_r, aug_g, aug_b = get_aug_param_torch(data, b=b, command=self.dst['command'])
                 aug_wbs = torch.stack((aug_r, aug_g, aug_b, aug_g), dim=1)

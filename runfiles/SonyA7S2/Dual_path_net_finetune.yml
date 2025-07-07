@@ -28,25 +28,27 @@ dst: &base_dst
   ori: False
   clip: True
   gpu_preprocess: True
+  iso_list: [800, 1600, 3200]
+  ratio_list: [100, 200]
 
 dst_train:
   <<: *base_dst
   mode: 'finetune'  # 使用finetune模式，对应12对数据
-  iso_list: [800, 1600, 3200]
-  ratio_list: [100, 200]
 
 # ✅ 正确的评估配置
 dst_eval:
+  <<: *base_dst
   mode: 'test'
-  crop_per_image: 0     # 不裁剪，使用完整图像
-  croptype: 'full_image' # 完整图像模式
-  patch_size: 0         # 不使用patch
+  # crop_per_image: 0     # 不裁剪，使用完整图像
+  # croptype: 'full_image' # 完整图像模式
+  # patch_size: 0         # 不使用patch
   
 dst_test:
+  <<: *base_dst
   mode: 'test'
-  crop_per_image: 0     # 不裁剪，使用完整图像  
-  croptype: 'full_image' # 完整图像模式
-  patch_size: 0         # 不使用patch
+  # crop_per_image: 0     # 不裁剪，使用完整图像  
+  # croptype: 'full_image' # 完整图像模式
+  # patch_size: 0         # 不使用patch
 
 # 使用与您原始模型相同的架构
 arch:
