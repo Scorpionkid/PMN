@@ -1,8 +1,8 @@
 mode: 'evaltest'
 checkpoint: 'saved_model/'
 fast_ckpt: 'checkpoints/SonyA7S2'
-model_name: 'SonyA7S2_DualPathNet_nf48_30M_colortest'
-# model_name: 'SonyA7S2_DualPathNet_sharedEnc_nf32_11M'
+# model_name: 'SonyA7S2_DualPathNet_nf48_25M_np&dw&ml'
+model_name: 'SonyA7S2_DualPathNet_noisemap_M1_1800'
 # TODO:两个模型测试
 # model_name: 'SonyA7S2_DualPathNet_ul_share_nf32_17M'
 # model_name: 'SonyA7S2_DualPathNet_ul_nf32_depwise_10M'
@@ -14,11 +14,11 @@ brightness_correct: True
 
 dst: &base_dst 
   root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/SID'
-  bias_dir: 'data/SonyA7S2/bias'
+  bias_dir: 'resources/SonyA7S2/BiasFrame_ET_1_30'
   ds_dir: 'resources/SonyA7S2'
   dataset: 'SID_Dataset' 
   dstname: 'SID'
-  command: 'augv2, idremap, darkshading2++'
+  command: 'augv2, idremap, darkshading2++, HB'
   # camera_params_file: 'resources/camera_params/camera_params.yaml'
   # use_noise_map: True
   # noise_map_method: 'iso'  # 'iso' 或 'params'
@@ -47,11 +47,13 @@ dst_eval:
   dstname: 'ELD'
   iso_list: [800, 1600, 3200]
   ratio_list: [100, 200]
+  # specific_scenes: [1]  # 只测试scene-01，或者 ['scene-01']
 dst_test:
   <<: *base_dst
   mode: 'evaltest'
   dataset: 'SID_Dataset' 
   dstname: 'SID'
+  # specific_images: ['10198']  # 指定要测试的图片名称
 
 arch:
   name: 'DPNet_E1'
@@ -74,7 +76,7 @@ arch:
   use_noise_map: True
   use_texture_detection: True
   enable_intermediate_supervision: True  
-  use_depthwise_separable: True
+  use_depthwise_separable: False
 
 loss:
   perceptual: True  
@@ -87,15 +89,17 @@ hyper:
   lr_scheduler: 'WarmupCosine'
   learning_rate: 2.e-4
   batch_size: 1
+  # last_epoch: 0
+  resume_from_epoch: 0
+  # resume_from_epoch: 1200
   last_epoch: 0
-  # last_epoch: -1
-  resume_from_epoch: 900
   step_size: 10
-  stop_epoch : 100
-  T: 1
+  stop_epoch : 1800
+  T: 3
   coldstart: False
   num_workers: 8
   num_gpus: 1
   save_freq: 10
-  plot_freq: 50
+  plot_freq: 100
   best_psnr: 0.
+  # best_psnr: 48.06
