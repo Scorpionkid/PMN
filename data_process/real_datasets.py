@@ -551,46 +551,36 @@ class Mix_Dataset(SID_Dataset):
         if data['black_lr']:
             # SNA+黑图
             iso_index = np.argmin(np.abs(self.legalISO-data['ISO']))
-            # 添加防御性检查
-            if len(self.blacks[iso_index]) == 0:
-                # 记录警告信息
-                # log(f'警告: ISO={data["ISO"]}的黑帧列表为空，使用替代方案', log='./logs/empty_blacks.log')
-                # 使用替代方案，例如将black_lr设为False
-                data['black_lr'] = False
-                lr_id = np.random.randint(len(self.infos[idx]['short'])) if self.args['mode']=='train' else 0
-                lr_raw = np.array(dataload(self.infos[idx]['short'][lr_id])).reshape(self.H,self.W)
-                dgain = self.infos[idx]['ratio'][lr_id]
+            # 原有逻辑，增加新的.mat暗帧支持逻辑
+            lr_id = np.random.randint(len(self.blacks[iso_index])) if self.args['mode']=='train' else 0
+            if 'lr10' in self.args['command']:
+                lr_id = np.random.randint(10)
+            
+            dark_frame_path = self.blacks[iso_index][lr_id]
+            
+            # 检查是否为.mat文件
+            if dark_frame_path.endswith('.mat'):
+                # 使用修改后的dataload函数加载.mat暗帧
+                lr_raw = dataload(dark_frame_path)
+                
+                # 验证尺寸
+                if lr_raw.shape != (self.H, self.W):
+                    lr_raw = lr_raw.reshape(self.H, self.W)
+                
+                # 可选：验证.mat文件中的ISO与期望值是否匹配
+                mat_metadata = self.load_mat_metadata(dark_frame_path)
+                if 'ISO' in mat_metadata:
+                    mat_iso = mat_metadata['ISO']
+                    expected_iso = self.legalISO[iso_index]
+                    if mat_iso != expected_iso:
+                        print(f"警告: .mat文件ISO({mat_iso})与期望ISO({expected_iso})不匹配")
+                
+                dgain = 400  # 保持原有逻辑
+                
             else:
-                # 原有逻辑，增加新的.mat暗帧支持逻辑
-                lr_id = np.random.randint(len(self.blacks[iso_index])) if self.args['mode']=='train' else 0
-                if 'lr10' in self.args['command']:
-                    lr_id = np.random.randint(10)
-                
-                dark_frame_path = self.blacks[iso_index][lr_id]
-                
-                # 检查是否为.mat文件
-                if dark_frame_path.endswith('.mat'):
-                    # 使用修改后的dataload函数加载.mat暗帧
-                    lr_raw = dataload(dark_frame_path)
-                    
-                    # 验证尺寸
-                    if lr_raw.shape != (self.H, self.W):
-                        lr_raw = lr_raw.reshape(self.H, self.W)
-                    
-                    # 可选：验证.mat文件中的ISO与期望值是否匹配
-                    mat_metadata = self.load_mat_metadata(dark_frame_path)
-                    if 'ISO' in mat_metadata:
-                        mat_iso = mat_metadata['ISO']
-                        expected_iso = self.legalISO[iso_index]
-                        if mat_iso != expected_iso:
-                            print(f"警告: .mat文件ISO({mat_iso})与期望ISO({expected_iso})不匹配")
-                    
-                    dgain = 400  # 保持原有逻辑
-                    
-                else:
-                    # 原有的RAW文件处理逻辑
-                    lr_raw = rawpy.imread(dark_frame_path).raw_image_visible
-                    dgain = 400
+                # 原有的RAW文件处理逻辑
+                lr_raw = rawpy.imread(dark_frame_path).raw_image_visible
+                dgain = 400
         else:
             lr_id = np.random.randint(len(self.infos[idx]['short'])) if self.args['mode']=='train' else 0
             lr_raw = np.array(dataload(self.infos[idx]['short'][lr_id])).reshape(self.H,self.W)
@@ -901,18 +891,10 @@ class ELD_Train_Dataset(ELD_Dataset):
             # darkshading初始化
             if 'darkshading' in self.args['command']:
                 self.get_darkshading(iso, naive=self.naive)
-                
-                # darkshading2需要额外的noise参数
                 if 'darkshading2' in self.args['command'] and iso not in self.noiseparam:
-                    self.noiseparam[iso] = get_camera_noisy_params_max(
-                        iso, camera_type=self.args['camera_type'], wp=self.args['wp']
-                    )
-            
-            # blc初始化
-            elif 'blc' in self.args['command']:
-                if os.path.exists(os.path.join(self.args['ds_dir'], f'darkshading_BLE.pkl')):
-                    with open(os.path.join(self.args['ds_dir'], f'darkshading_BLE.pkl'), 'rb') as f:
-                        self.blc_mean = pkl.load(f)
+                    get_camera_noisy_params_max(f'SonyA7S2_{iso}')
+                    self.noiseparam[iso] = get_camera_noisy_params_max(f'SonyA7S2_{iso}')
+                    self.noiseparam[iso]['Kmax'] = 0.0009563*iso
         
         # HBR参数设置
         if 'darkshading' in self.args['command']:
@@ -924,15 +906,18 @@ class ELD_Train_Dataset(ELD_Dataset):
     
     def _init_basic_noise_calibration(self):
         """初始化基础噪声标定参数（eval模式）"""
-        for iso in self.iso_list:
-            if self.naive:
-                if os.path.exists(os.path.join(self.args['ds_dir'], f'darkshading_BLE.pkl')):
-                    with open(os.path.join(self.args['ds_dir'], f'darkshading_BLE.pkl'), 'rb') as f:
-                        self.blc_mean = pkl.load(f)
-                self.get_darkshading(iso)
-                self.blc_mean[iso] = self.get_darkshading(iso).mean()
-            else:
-                self.get_darkshading(iso)
+        if 'darkshading' in self.args['command'] or 'blc' in self.args['command']:
+            for iso in self.iso_list:
+                if self.naive:
+                    if os.path.exists(os.path.join(self.args['ds_dir'], f'darkshading_BLE.pkl')):
+                        with open(os.path.join(self.args['ds_dir'], f'darkshading_BLE.pkl'), 'rb') as f:
+                            self.blc_mean = pkl.load(f)
+                    self.get_darkshading(iso)
+                    self.blc_mean[iso] = raw2bayer(self.darkshading[iso], norm=False, clip=False, 
+                                            wp=self.args['wp']-self.args['bl'], bl=0)
+                    self.blc_mean[iso] = np.mean(self.blc_mean[iso])
+                else:
+                    self.get_darkshading(iso, naive=self.naive)
     
     def load_mat_metadata(self, mat_path):
         """
@@ -964,42 +949,7 @@ class ELD_Train_Dataset(ELD_Dataset):
             print(f"警告: 无法从{mat_path}提取元数据: {e}")
             return {}
     
-    def record_bias_frames(self):
-        """记录bias frames用于SNA"""
-        log('Recording Bias Frames...')
-        self.black_dirs = sorted(os.listdir(self.args['bias_dir']), key=lambda x: int(x))
-        self.legalISO = np.array([int(dirname) for dirname in self.black_dirs])
-        self.black_dirs = [os.path.join(self.args['bias_dir'], dirname) for dirname in self.black_dirs]
-        self.blacks = [None] * len(self.legalISO)
-        for i in range(len(self.legalISO)):
-            self.blacks[i] = [os.path.join(self.black_dirs[i], filename) 
-                            for filename in os.listdir(self.black_dirs[i])]
-    
-    def get_darkshading(self, iso, exp=25, naive=True, num=None, remake=False):
-        """获取dark shading校正参数"""
-        branch = '_highISO' if iso > 1600 else '_lowISO'
-        if iso not in self.darkshading or remake:
-            ds_k = np.load(os.path.join(self.args['ds_dir'], f'darkshading{branch}_k.npy'))
-            ds_b = np.load(os.path.join(self.args['ds_dir'], f'darkshading{branch}_b.npy'))
-            
-            if naive:
-                with open(os.path.join(self.args['ds_dir'], f'darkshading_BLE.pkl'), 'rb') as f:
-                    self.blc_mean = pkl.load(f)
-                BLE = self.blc_mean[iso]
-            else:
-                with open(os.path.join(self.args['ds_dir'], f'BLE_t.pkl'), 'rb') as f:
-                    self.blc_mean = pkl.load(f)
-                BLE = self.blc_mean[iso]['b']
-            
-            # D_{ds} = D_{FPNk} + D_{FPNb} + BLE(ISO, t)
-            self.darkshading[iso] = ds_k * iso + ds_b + BLE
-        
-        if naive:
-            return self.darkshading[iso]
-        else:
-            kt = np.poly1d(self.blc_mean[f'kt{branch}'])
-            BLE = kt(iso) * exp
-            return self.darkshading[iso] + BLE
+
     
     def __getitem__(self, idx):
         """
@@ -1035,41 +985,38 @@ class ELD_Train_Dataset(ELD_Dataset):
             if data['black_lr']:
                 # 使用black frame进行SNA
                 iso_index = np.argmin(np.abs(self.legalISO - data['ISO']))
-                if len(self.blacks[iso_index]) == 0:
-                    data['black_lr'] = False
-                    lr_raw = np.array(dataload(self.infos[scene_id][lr_id]['data'])).reshape(self.H, self.W)
+                
+                # 原有逻辑，增加新的.mat暗帧支持逻辑
+                lr_id_black = np.random.randint(len(self.blacks[iso_index]))
+                if 'lr10' in self.args['command']:
+                    lr_id_black = np.random.randint(10)
+                
+                dark_frame_path = self.blacks[iso_index][lr_id_black]
+                
+                # 检查是否为.mat文件
+                if dark_frame_path.endswith('.mat'):
+                    # 使用dataload函数加载.mat暗帧
+                    lr_raw = dataload(dark_frame_path)
+                    
+                    # 验证尺寸
+                    if lr_raw.shape != (self.H, self.W):
+                        lr_raw = lr_raw.reshape(self.H, self.W)
+                    
+                    # 可选：验证.mat文件中的ISO与期望值是否匹配
+                    mat_metadata = self.load_mat_metadata(dark_frame_path)
+                    if 'ISO' in mat_metadata:
+                        mat_iso = mat_metadata['ISO']
+                        expected_iso = self.legalISO[iso_index]
+                        if mat_iso != expected_iso:
+                            print(f"警告: .mat文件ISO({mat_iso})与期望ISO({expected_iso})不匹配")
+                    
+                    dgain = 400  # 保持原有逻辑
                 else:
-                    # 原有逻辑，增加新的.mat暗帧支持逻辑
-                    lr_id_black = np.random.randint(len(self.blacks[iso_index]))
-                    if 'lr10' in self.args['command']:
-                        lr_id_black = np.random.randint(10)
-                    
-                    dark_frame_path = self.blacks[iso_index][lr_id_black]
-                    
-                    # 检查是否为.mat文件
-                    if dark_frame_path.endswith('.mat'):
-                        # 使用dataload函数加载.mat暗帧
-                        lr_raw = dataload(dark_frame_path)
-                        
-                        # 验证尺寸
-                        if lr_raw.shape != (self.H, self.W):
-                            lr_raw = lr_raw.reshape(self.H, self.W)
-                        
-                        # 可选：验证.mat文件中的ISO与期望值是否匹配
-                        mat_metadata = self.load_mat_metadata(dark_frame_path)
-                        if 'ISO' in mat_metadata:
-                            mat_iso = mat_metadata['ISO']
-                            expected_iso = self.legalISO[iso_index]
-                            if mat_iso != expected_iso:
-                                print(f"警告: .mat文件ISO({mat_iso})与期望ISO({expected_iso})不匹配")
-                        
-                        dgain = 400  # 保持原有逻辑
-                    else:
-                        # 原有的RAW文件处理逻辑
-                        lr_raw = rawpy.imread(dark_frame_path).raw_image_visible
-                        dgain = 400
-                    
-                    data['ratio'] = dgain
+                    # 原有的RAW文件处理逻辑
+                    lr_raw = rawpy.imread(dark_frame_path).raw_image_visible
+                    dgain = 400
+                
+                data['ratio'] = dgain
             else:
                 lr_raw = np.array(dataload(self.infos[scene_id][lr_id]['data'])).reshape(self.H, self.W)
         else:
@@ -1082,8 +1029,6 @@ class ELD_Train_Dataset(ELD_Dataset):
         # === darkshading/blc处理 ===
         if 'darkshading' in self.args['command']:
             lr_raw = lr_raw - self.get_darkshading(iso=data['ISO'], exp=data['exp'], naive=self.naive)
-            if 'd' in self.args['noise_code']:
-                lr_raw = lr_raw + self.get_darkshading(iso=data['ISO'], exp=data['exp'], naive=self.naive).mean()
             if 'darkshading2' in self.args['command'] and self.args["mode"] == 'finetune':
                 lr_raw += np.random.randn() * self.noiseparam[data['ISO']]['biassig']
         elif 'blc' in self.args['command'] and 'HB' not in self.args['command']:
@@ -1118,60 +1063,21 @@ class ELD_Train_Dataset(ELD_Dataset):
             data['ratio'] = np.array([data['ratio']], dtype=np.float32)
         
         # === 后处理 ===
-        if self.args['ori'] is False:
-            lr_crops *= data['ratio']
-        
-        if self.args['clip']:
-            lb = -100 if 'HB' in self.args['command'] else 0
-            lr_crops = lr_crops.clip(lb, 1)
-            hr_crops = hr_crops.clip(0, 1)
-        
+        if self.args["mode"] != 'finetune':  # 只在非训练模式下处理
+            if self.args['ori'] is False:
+                lr_crops *= data['ratio']
+            
+            if self.args['clip']:
+                lb = -100 if 'HB' in self.args['command'] else 0
+                lr_crops = lr_crops.clip(lb, 1)
+                hr_crops = hr_crops.clip(0, 1)
+                
         data["lr"] = np.ascontiguousarray(lr_crops)
         data["hr"] = np.ascontiguousarray(hr_crops)
-        
+            
         return data
     
     # === 继承RealBase_Dataset的crop和数据增强方法 ===
-    
-    def init_random_crop_point(self, mode='non-overlapping'):
-        """初始化随机裁剪点"""
-        h, w = self.H, self.W
-        self.h_start, self.w_start = [], []
-        self.h_end, self.w_end = [], []
-        self.aug = np.random.randint(0, 4, size=self.args['crop_per_image'])
-        
-        if mode == 'non-overlapping':
-            # 非重叠裁剪
-            nh = h // self.args["patch_size"]
-            nw = w // self.args["patch_size"]
-            
-            crop_points = []
-            for i in range(nh):
-                for j in range(nw):
-                    crop_points.append((i, j))
-            
-            # 随机选择crop_per_image个点
-            selected_points = np.random.choice(len(crop_points), 
-                                             min(self.args['crop_per_image'], len(crop_points)), 
-                                             replace=False)
-            
-            for idx in selected_points:
-                i, j = crop_points[idx]
-                h_start = i * self.args["patch_size"]
-                w_start = j * self.args["patch_size"]
-                self.h_start.append(h_start)
-                self.w_start.append(w_start)
-                self.h_end.append(h_start + self.args["patch_size"])
-                self.w_end.append(w_start + self.args["patch_size"])
-        
-        else:  # random_crop
-            for i in range(self.args['crop_per_image']):
-                h_start = np.random.randint(0, h - self.args["patch_size"] + 1)
-                w_start = np.random.randint(0, w - self.args["patch_size"] + 1)
-                self.h_start.append(h_start)
-                self.w_start.append(w_start)
-                self.h_end.append(h_start + self.args["patch_size"])
-                self.w_end.append(w_start + self.args["patch_size"])
     
     def random_crop(self, img):
         """随机裁剪函数"""

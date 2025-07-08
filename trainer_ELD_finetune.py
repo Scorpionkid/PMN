@@ -5,6 +5,7 @@ ELD微调训练脚本
 import os
 import torch
 from trainer_SID import SID_Trainer
+from utils import *
 
 def load_pretrained_model(net, pretrained_path):
     """加载预训练模型"""
@@ -105,10 +106,39 @@ if __name__ == '__main__':
     else:
         # 创建并运行微调训练器
         trainer = FineTuneTrainer()
-        
         if trainer.mode == 'train':
-            print(f"开始ELD微调训练，数据量: {len(trainer.dst_train)}")
-            trainer.train()  # 直接使用父类的train方法
+            trainer.train()
+            trainer.mode = 'evaltest'
+        
+        # best_model
+        best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
+        if os.path.exists(best_model_path) is False: 
+            best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
+        best_model = torch.load(best_model_path, map_location=trainer.device)
+
+        # 检查加载的文件是新格式还是旧格式
+        if isinstance(best_model, dict) and 'model' in best_model:
+            # 新格式：包含完整训练状态
+            model_weights = best_model['model']
+            log(f"加载新格式模型权重用于评估")
+            log(f"Epoch{best_model['epoch']}, Best_PSNR{best_model['best_psnr']}")
         else:
-            print("开始评估")
-            trainer.eval(-1)  # 直接使用父类的eval方法
+            # 旧格式：仅包含模型权重
+            model_weights = best_model
+            log(f"加载旧格式模型权重用于评估")
+
+        trainer.net = load_weights(trainer.net, model_weights, multi_gpu=trainer.multi_gpu)
+        if 'test' in trainer.mode:
+            # ELD
+            trainer.change_eval_dst('test')
+            for dgain in trainer.args['dst_test']['ratio_list']:
+                info_path = os.path.join(trainer.cache_dir, f'{trainer.dstname}_{dgain}.pkl')
+                if os.path.exists(info_path):
+                    with open(info_path,'rb') as f:
+                        trainer.infos = pkl.load(f)
+                log(f'ELD Datasets: Dgain={dgain}',log=f'./logs/log_{trainer.model_name}.log')
+                trainer.dst_eval.ratio_list=[dgain]
+                trainer.dst_eval.recheck_length()
+                metrics = trainer.eval(-1)
+
+        log(f'Metrics have been saved in ./metrics/{trainer.model_name}_metrics.pkl')
