@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel
+import torchvision.models as models
 from torch.optim.lr_scheduler import *
 import glob
 import matplotlib
@@ -96,6 +97,103 @@ def metrics_recorder(file, names, psnrs, ssims):
     with open(file, 'wb') as f:
         pkl.dump(metrics, f)
     return metrics
+
+
+class LPIPS_Evaluator(nn.Module):
+    """
+    LPIPS指标评估器，用于计算感知相似度
+    """
+    def __init__(self, use_gpu=True):
+        super(LPIPS_Evaluator, self).__init__()
+        self.use_gpu = use_gpu
+        
+        # 加载预训练的VGG网络
+        self.features = models.vgg19(pretrained=True).features
+        
+        # 冻结网络参数
+        for param in self.features.parameters():
+            param.requires_grad = False
+            
+        # 提取的层级 (VGG16的关键relu层)
+        self.feature_layers = [3, 8, 17, 26, 35]
+        
+        # ImageNet归一化参数
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        
+        if use_gpu and torch.cuda.is_available():
+            self.features = self.features.cuda()
+            self.mean = self.mean.cuda()
+            self.std = self.std.cuda()
+    
+
+    def normalize_tensor(self, tensor):
+        from data_process.process import process
+        """归一化RGB tensor到ImageNet标准"""
+        if tensor.shape[1] == 4:
+            # 使用现有的process函数转换RAW到RGB
+            # 需要准备默认的wb和ccm参数
+            device = tensor.device
+            B = tensor.shape[0]
+            
+            # SonyA7S2默认参数
+            wb = torch.tensor([1.96875, 1.0, 1.444, 1.0]).view(1, 4).expand(B, 4).to(device)
+            ccm = torch.tensor([[ 1.9712269, -0.6789218, -0.29230508],
+                            [-0.29104823,  1.748401,  -0.45735288],
+                            [ 0.02051281, -0.5380369,   1.5175241]]).view(1, 3, 3).expand(B, 3, 3).to(device)
+            
+            tensor = process(tensor, wb, ccm, gamma=2.2)
+        
+        tensor = torch.clamp(tensor, 0, 1)
+        return (tensor - self.mean) / self.std
+    
+    def extract_features(self, x):
+        """提取VGG特征"""
+        features = []
+        x = self.normalize_tensor(x)
+        
+        for i, layer in enumerate(self.features):
+            x = layer(x)
+            if i in self.feature_layers:
+                features.append(x)
+        
+        return features
+    
+    def forward(self, img1, img2):
+        """计算LPIPS距离"""
+        # 提取特征
+        features1 = self.extract_features(img1)
+        features2 = self.extract_features(img2)
+        
+        # 计算每层的距离并加权平均
+        total_distance = 0
+        for f1, f2 in zip(features1, features2):
+            dist = torch.mean((f1 - f2) ** 2, dim=[2, 3])  # 空间维度平均
+            dist = torch.mean(dist, dim=1)  # 通道维度平均
+            total_distance += dist
+        
+        return total_distance.mean() / len(features1)
+
+def LPIPS_Metric(pred, target, lpips_evaluator=None):
+    """
+    计算LPIPS指标，与PSNR_Loss保持一致的调用方式
+    
+    Args:
+        pred: 预测图像 tensor [B, C, H, W]，值域[0,1]
+        target: 目标图像 tensor [B, C, H, W]，值域[0,1]  
+        lpips_evaluator: LPIPS评估器实例，如果为None会创建新的
+    
+    Returns:
+        lpips_score: LPIPS分数 (越小越好)
+    """
+    if lpips_evaluator is None:
+        use_gpu = pred.is_cuda
+        lpips_evaluator = LPIPS_Evaluator(use_gpu=use_gpu)
+        if use_gpu:
+            lpips_evaluator = lpips_evaluator.cuda()
+    
+    with torch.no_grad():
+        return lpips_evaluator(pred, target)
     
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -464,7 +562,7 @@ def plot_sample(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
 
 def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet', 
                 epoch=-1, print_metrics=False, save_plot=True, save_path='./', res=None, 
-                detail_output=None, denoise_output=None):
+                detail_output=None, denoise_output=None, lpips_net=None):
     """
     扩展的可视化函数，处理多输出并保存到场景专用目录
     
@@ -500,6 +598,7 @@ def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
     # 计算PSNR和SSIM
     psnr = []
     ssim = []
+    lpips = []
     
     if res is None:
         # 计算输入和主输出的指标
@@ -513,6 +612,7 @@ def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
         psnr.append(res[2])  # 主输出PSNR
         ssim.append(res[1])  # 输入SSIM
         ssim.append(res[3])  # 主输出SSIM
+        lpips.append(res[4])
     
     # 计算细节路径的指标
     if detail_output is not None:
@@ -633,7 +733,7 @@ def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
         #     except Exception as e:
         #         print(f"警告：生成差异图出错，但继续处理：{str(e)}")
 
-    return psnr, ssim, filename
+    return psnr, ssim, lpips, filename
 
 def save_picture(img_sr, save_path='./images/test',frame_id='0000'):
     # 变回uint8
@@ -720,22 +820,37 @@ def dataload(path):
     elif suffix in ['.mat']:
         # 专门处理.mat暗帧格式
         import scipy.io as sio  
-        mat_data = sio.loadmat(path)
+        # 检查文件大小，避免读取损坏文件
+        file_size = os.path.getsize(path)
+        if file_size == 0:
+            raise OSError(f"Empty file: {path}")
         
-        # 主图像数据在'Inoisy_crop'键下
-        if 'Inoisy_crop' in mat_data:
-            data = mat_data['Inoisy_crop']
-        else:
-            # # 备用方案：寻找最大的2D数组
-            # for key, value in mat_data.items():
-            #     if not key.startswith('__') and isinstance(value, np.ndarray) and value.ndim == 2:
-            #         data = value
-            #         break
-            # else:
-            raise ValueError(f"无法从{path}中找到图像数据")
+        try:
+            mat_data = sio.loadmat(path)
+            
+            if 'Inoisy_crop' in mat_data:
+                data = mat_data['Inoisy_crop']
+            else:
+                # 备用方案
+                for key, value in mat_data.items():
+                    if not key.startswith('__') and isinstance(value, np.ndarray) and value.ndim == 2:
+                        data = value
+                        break
+                else:
+                    raise ValueError(f"No image data found in {path}")
+            
+            # 确保数据类型正确
+            if data.dtype != np.float32:
+                data = data.astype(np.float32)
+                
+        except Exception as mat_error:
+            print(f"❌ 损坏的.mat文件: {path}")
+            print(f"   错误: {mat_error}")
+            # 记录损坏文件
+            with open("corrupted_files.log", "a") as f:
+                f.write(f"{path}: {mat_error}\n")
+            raise OSError(f"Corrupted .mat file: {path}")
         
-        # 确保数据类型正确（从uint16转为float32）
-        data = data.astype(np.float32)
     elif suffix in ['.jpg', '.png', '.bmp', 'tiff']:
         data = cv2.imread(path)
     else: raise ValueError(f"不适合的文件格式, {suffix}")
@@ -772,6 +887,8 @@ def pth_transfer(src_path='/data/ELD/checkpoints/sid-ours-inc4/model_200_0025760
     else:
         model_src = model_src['netG']
         torch.save(model_src, dst_path)
+
+
     
 if __name__ == '__main__':
     # pth_transfer('/data/ELD/checkpoints/sid-paired/model_200_00280000.pt', 'checkpoints/SonyA7S2_Paired_Official_last_model')

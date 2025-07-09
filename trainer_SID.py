@@ -89,6 +89,12 @@ class SID_Trainer(Base_Trainer):
 
         self.corrector = IlluminanceCorrect()
         torch.backends.cudnn.benchmark = True
+        # 初始化LPIPS评估器 (仿照现有代码结构)
+        if torch.cuda.is_available():
+            self.lpips_evaluator = LPIPS_Evaluator(use_gpu=True).cuda()
+        else:
+            self.lpips_evaluator = LPIPS_Evaluator(use_gpu=False)
+
         # model log
         self.best_psnr = self.hyper['best_psnr'] if 'best_psnr' in self.hyper else 0
         last_eval_epoch = self.hyper['last_epoch'] // self.hyper['plot_freq']
@@ -99,6 +105,10 @@ class SID_Trainer(Base_Trainer):
         self.eval_ssim_lr = AverageMeter('SSIM', ':4f')
         self.eval_psnr_dn = AverageMeter('PSNR', ':2f')
         self.eval_ssim_dn = AverageMeter('SSIM', ':4f')
+        # 添加LPIPS统计器 (仿照现有的eval_psnr)
+        self.eval_lpips = AverageMeter('LPIPS', ':4f')      # 总体LPIPS
+        self.eval_lpips_lr = AverageMeter('LPIPS_LR', ':4f') # 输入图像LPIPS  
+        self.eval_lpips_dn = AverageMeter('LPIPS_DN', ':4f') # 输出图像LPIPS
 
         # load weight
         resume_epoch = self.hyper.get('resume_from_epoch', 0)
@@ -317,6 +327,7 @@ class SID_Trainer(Base_Trainer):
                         psnr = PSNR_Loss(pred, imgs_hr)
                         self.train_psnr.update(psnr.item())
 
+
                     # 格式化损失值用于显示
                     if 'PBNet' in self.arch['name']:
 
@@ -334,6 +345,7 @@ class SID_Trainer(Base_Trainer):
                     runtime['total'] = runtime['preprocess']+runtime['dataloader']+runtime['net']+runtime['bp']
                     t.set_description(f'Epoch {epoch}')
                     t.set_postfix({'lr':f"{lr:.2e}", 'PSNR':f"{self.train_psnr.avg:.2f}",
+                                    'LPIPS': f"{self.eval_lpips.avg:.4f}",
                                     # 'loader':f"{100*runtime['dataloader']/runtime['total']:.1f}%",
                                     # 'process':f"{100*runtime['preprocess']/runtime['total']:.1f}%",
                                     # 'net':f"{100*runtime['net']/runtime['total']:.1f}%",
@@ -419,6 +431,12 @@ class SID_Trainer(Base_Trainer):
         self.eval_psnr_dn.reset()
         self.eval_ssim_lr.reset()
         self.eval_ssim_dn.reset()
+
+        # === 新增：重置LPIPS统计器 ===
+        self.eval_lpips.reset()
+        self.eval_lpips_lr.reset()
+        self.eval_lpips_dn.reset()
+
         # record every metric
         metrics = {}
         metrics_path = f'./metrics/{self.model_name}_metrics.pkl'
@@ -503,9 +521,15 @@ class SID_Trainer(Base_Trainer):
                     output = tensor2im(imgs_dn)
                     target = tensor2im(imgs_hr)
                     res = quality_assess(output, target, data_range=255)
-                    raw_metrics = [res['PSNR'], res['SSIM']]
+
+                    lpips_score = LPIPS_Metric(imgs_dn, imgs_hr, self.lpips_evaluator)
+                    res['LPIPS'] = lpips_score.item()  # 添加到res字典中
+                    
+                    raw_metrics = [res['PSNR'], res['SSIM'], res['LPIPS']]  # 修改raw_metrics
                     self.eval_psnr.update(res['PSNR'])
                     self.eval_ssim.update(res['SSIM'])
+                    self.eval_lpips.update(res['LPIPS'])  # 新增
+
                     metrics[name] = raw_metrics
                     # convert raw to rgb
                     if save_plot:
@@ -515,6 +539,7 @@ class SID_Trainer(Base_Trainer):
                             raw_metrics = [res_in['PSNR'], res_in['SSIM']] + raw_metrics
                         else:
                             raw_metrics = [self.infos[k]['PSNR_raw'], self.infos[k]['SSIM_raw']] + raw_metrics
+
                         if epoch > 0:
                             # self.multiprocess_plot(imgs_lr, imgs_dn, imgs_hr, 
                             #         wb, ccm, name, save_plot, epoch, raw_metrics, k)
@@ -551,12 +576,13 @@ class SID_Trainer(Base_Trainer):
                                 pool.submit(plot_sample_V2, inputs, output, target, 
                                     filename=name, save_plot=save_plot, epoch=epoch,
                                     model_name=self.model_name, save_path=self.sample_dir,
-                                    res=raw_metrics, detail_output=detail_rgb, denoise_output=denoise_rgb
+                                    res=raw_metrics, detail_output=detail_rgb, denoise_output=denoise_rgb,
+                                    lpips_net=self.lpips_evaluator
                                 )
                             )
 
                     t.set_description(f'{name}')
-                    t.set_postfix({'PSNR':f"{self.eval_psnr.avg:.2f}"})
+                    t.set_postfix({'PSNR':f"{self.eval_psnr.avg:.2f}", 'LPIPS': f"{self.eval_lpips.avg:.4f}"})
                     t.update(1)
 
         if save_plot:
@@ -566,16 +592,19 @@ class SID_Trainer(Base_Trainer):
             else:
                 pool.shutdown(wait=True)
                 for task in as_completed(task_list):
-                    psnr, ssim, name = task.result()
-                    metrics[name] = (psnr[1], ssim[1])
+                    psnr, ssim, lpips, name = task.result()  # 新增lpips
+                    metrics[name] = (psnr[1], ssim[1], lpips[1])  # 新增lpips[1]
                     # if name[0] == '1' or self.dstname=='ELD':
                     self.eval_psnr_lr.update(psnr[0])
                     self.eval_psnr_dn.update(psnr[1])
                     self.eval_ssim_lr.update(ssim[0])
                     self.eval_ssim_dn.update(ssim[1])
+                    # === 新增：更新LPIPS统计器 ===
+                    self.eval_lpips_dn.update(lpips[0])
         else:
             self.eval_psnr_dn = self.eval_psnr
             self.eval_ssim_dn = self.eval_ssim
+            self.eval_lpips_dn = self.eval_lpips
 
         # 超过最好记录才保存
         if self.eval_psnr_dn.avg >= self.best_psnr and epoch > 0:
@@ -585,9 +614,10 @@ class SID_Trainer(Base_Trainer):
             # torch.save(model_dict, f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
             self.save_checkpoint(epoch, f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
 
-        log(f"Epoch {epoch}: PSNR={self.eval_psnr.avg:.2f}\n"
+        log(f"Epoch {epoch}: PSNR={self.eval_psnr.avg:.2f}, lpips={self.eval_lpips.avg:.4f}\n"
             +f"psnrs_lr={self.eval_psnr_lr.avg:.2f}, psnrs_dn={self.eval_psnr_dn.avg:.2f}"
             +f"\nssims_lr={self.eval_ssim_lr.avg:.4f}, ssims_dn={self.eval_ssim_dn.avg:.4f}",
+            +f"\n lpips_dn={self.eval_lpips_dn.avg:.4f}",
             log=f'./logs/log_{self.model_name}.log')
         if epoch < 0:
             with open(metrics_path, 'wb') as f:
@@ -619,19 +649,21 @@ class SID_Trainer(Base_Trainer):
         #                 save_path=self.sample_dir,
         #                 res=raw_metrics)
 
-        psnr, ssim, _ = plot_sample_V2(inputs, output, target, 
+        psnr, ssim, lpips, _ = plot_sample_V2(inputs, output, target, 
                     filename=name, 
                     save_plot=save_plot, epoch=epoch,
                     model_name=self.model_name,
                     save_path=self.sample_dir,
                     res=raw_metrics,
                     detail_output=detail_rgb,
-                    denoise_output=denoise_rgb)
+                    denoise_output=denoise_rgb,
+                    lpips_net=self.lpips_evaluator)
         
         self.eval_psnr_lr.update(psnr[0])
         self.eval_psnr_dn.update(psnr[1])
         self.eval_ssim_lr.update(ssim[0])
         self.eval_ssim_dn.update(ssim[1])
+        self.eval_lpips_dn.update(lpips[0])
 
     def predict(self, raw, name='ds'):
         self.net.eval()
@@ -957,9 +989,9 @@ if __name__ == '__main__':
         trainer.eval_psnr.plot_history(savefile=os.path.join(trainer.sample_dir, f'{trainer.model_name}_eval_psnr.jpg'))
         trainer.mode = 'evaltest'
     # best_model
-    # best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
-    # if os.path.exists(best_model_path) is False: 
-    best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
+    best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
+    if os.path.exists(best_model_path) is False: 
+        best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
     best_model = torch.load(best_model_path, map_location=trainer.device)
 
     # 检查加载的文件是新格式还是旧格式
