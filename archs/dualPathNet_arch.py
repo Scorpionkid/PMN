@@ -9,7 +9,8 @@ from .dual_path_components import (
     SharpnessRecovery,
     RAWTextureDetector,
     EnhancedDenoisePath,
-    EnhancedDetailPath
+    EnhancedDetailPath,
+    Freq
 )
 
 
@@ -30,6 +31,9 @@ class IndependentPathEncoder(nn.Module):
             self.path = EnhancedDetailPath(out_channels, heads)
         else:
             self.path = EnhancedDenoisePath(out_channels, heads)
+
+        self.use_noise_map = use_noise_map
+        self.use_texture_detection = use_texture_detection
 
     def forward(self, x, noise_map=None, texture_mask=None):
         # 特征提取
@@ -74,10 +78,10 @@ class DualPathBlock(nn.Module):
 
         return output, detail, denoise  # 修改：返回融合输出和两条路径的独立输出
 
-class DualPathUNet_E1(nn.Module):
+class DPNet_E1(nn.Module):
     """double path U-Net, apply double path design on each scale of U-Net"""
     def __init__(self, args=None,  texture_params=None, **kwargs):
-        super(DualPathUNet_E1, self).__init__()
+        super(DPNet_E1, self).__init__()
 
         base_channels = args['nf']
         in_channels = args['in_channels']
@@ -123,18 +127,24 @@ class DualPathUNet_E1(nn.Module):
         self.enc1_detail = IndependentPathEncoder(
             enc1_in_channels, base_channels,
             is_detail_path=True,
+            use_noise_map=self.use_noise_map,
+            use_texture_detection=self.use_texture_detection,
             heads=heads[0],
             texture_params=self.texture_params
         )
         self.enc2_detail = IndependentPathEncoder(
             base_channels, base_channels*2,
             is_detail_path=True,
+            use_noise_map=self.use_noise_map,
+            use_texture_detection=self.use_texture_detection,
             heads=heads[1],
             texture_params=self.texture_params
         )
         self.enc3_detail = IndependentPathEncoder(
             base_channels*2, base_channels*4,
             is_detail_path=True,
+            use_noise_map=self.use_noise_map,
+            use_texture_detection=self.use_texture_detection,
             heads=heads[2],
             texture_params=self.texture_params
         )
@@ -143,21 +153,30 @@ class DualPathUNet_E1(nn.Module):
         self.enc1_denoise = IndependentPathEncoder(
             enc1_in_channels, base_channels,
             is_detail_path=False,
+            use_noise_map=self.use_noise_map,
+            use_texture_detection=self.use_texture_detection,
             heads=heads[0],
             texture_params=self.texture_params
         )
         self.enc2_denoise = IndependentPathEncoder(
             base_channels, base_channels*2,
             is_detail_path=False,
+            use_noise_map=self.use_noise_map,
+            use_texture_detection=self.use_texture_detection,
             heads=heads[1],
             texture_params=self.texture_params
         )
         self.enc3_denoise = IndependentPathEncoder(
             base_channels*2, base_channels*4,
             is_detail_path=False,
+            use_noise_map=self.use_noise_map,
+            use_texture_detection=self.use_texture_detection,
             heads=heads[2],
             texture_params=self.texture_params
         )
+
+        self.freq_enhance_detail = Freq(base_channels*4)
+        self.freq_enhance_denoise = Freq(base_channels*4)
 
         # 瓶颈层 - 这里开始两条路径融合
         self.bottleneck = DualPathBlock(
@@ -248,7 +267,11 @@ class DualPathUNet_E1(nn.Module):
 
         # 瓶颈层 - 合并两条路径
         # 将两个独立路径的特征连接起来输入到瓶颈层
-        bottleneck_input = (enc3_detail_down + enc3_denoise_down) / 2  # 简单平均或者其他融合策略
+        enc3_detail_enhanced = enc3_detail_down + self.freq_enhance_detail(enc3_detail_down)
+        enc3_denoise_enhanced = enc3_denoise_down + self.freq_enhance_denoise(enc3_denoise_down)
+
+        # 然后使用增强后的特征
+        bottleneck_input = (enc3_detail_enhanced + enc3_denoise_enhanced) / 2
         bottleneck_output, bn_detail, bn_denoise = self.bottleneck(
             bottleneck_input, nm_down3, tm_down3
         )
