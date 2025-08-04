@@ -1,6 +1,8 @@
 import os
 import time
 from torch.optim import Adam, lr_scheduler
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.metrics import structural_similarity as compare_ssim
 from data_process import *
 from utils import *
 from archs import *
@@ -102,13 +104,19 @@ class SID_Trainer(Base_Trainer):
         self.eval_psnr = AverageMeter('PSNR', ':2f', last_epoch=last_eval_epoch)
         self.eval_ssim = AverageMeter('SSIM', ':4f')
         self.eval_psnr_lr = AverageMeter('PSNR', ':2f')
+        self.eval_psnr_detail = AverageMeter('PSNR', ':2f')
+        self.eval_psnr_denoise = AverageMeter('PSNR', ':2f')
+        self.eval_ssim_detail = AverageMeter('SSIM', ':4f')
+        self.eval_ssim_denoise = AverageMeter('SSIM', ':4f')
         self.eval_ssim_lr = AverageMeter('SSIM', ':4f')
         self.eval_psnr_dn = AverageMeter('PSNR', ':2f')
         self.eval_ssim_dn = AverageMeter('SSIM', ':4f')
         # 添加LPIPS统计器 (仿照现有的eval_psnr)
         self.eval_lpips = AverageMeter('LPIPS', ':4f')      # 总体LPIPS
-        self.eval_lpips_lr = AverageMeter('LPIPS_LR', ':4f') # 输入图像LPIPS  
+        self.eval_lpips_lr = AverageMeter('LPIPS', ':4f') # 输入图像LPIPS  
         self.eval_lpips_dn = AverageMeter('LPIPS_DN', ':4f') # 输出图像LPIPS
+        self.eval_lpips_detail = AverageMeter('LPIPS', ':4f') # 输出图像LPIPS
+        self.eval_lpips_denoise = AverageMeter('LPIPS', ':4f') # 输出图像LPIPS
 
         # load weight
         resume_epoch = self.hyper.get('resume_from_epoch', 0)
@@ -415,12 +423,13 @@ class SID_Trainer(Base_Trainer):
                     if isinstance(model, dict) and 'model' in model:
                         # 新格式：包含完整训练状态
                         model_weights = model['model']
+                        epoch = model['epoch']
                     else:
                         # 旧格式：仅包含模型权重
                         model_weights = model
 
                     self.net = load_weights(self.net, model_weights, self.multi_gpu, by_name=True)
-                    log(f'Successfully reload best model (Eval PSNR:{self.best_psnr})',
+                    log(f'Successfully reload best model (Epoch:{epoch}, Eval PSNR:{self.best_psnr})',
                         log=f'./logs/log_{self.model_name}.log')
 
     def eval(self, epoch=-1):
@@ -428,6 +437,10 @@ class SID_Trainer(Base_Trainer):
         self.eval_psnr.reset()
         self.eval_ssim.reset()
         self.eval_psnr_lr.reset()
+        self.eval_psnr_denoise.reset()
+        self.eval_psnr_detail.reset()
+        self.eval_ssim_denoise.reset()
+        self.eval_ssim_detail.reset()
         self.eval_psnr_dn.reset()
         self.eval_ssim_lr.reset()
         self.eval_ssim_dn.reset()
@@ -436,6 +449,8 @@ class SID_Trainer(Base_Trainer):
         self.eval_lpips.reset()
         self.eval_lpips_lr.reset()
         self.eval_lpips_dn.reset()
+        self.eval_lpips_denoise.reset()
+        self.eval_lpips_detail.reset()
 
         # record every metric
         metrics = {}
@@ -473,8 +488,8 @@ class SID_Trainer(Base_Trainer):
                     # imgs_lr = self.dst_eval.eval_merge(croped_imgs_lr)
                     # imgs_dn = self.dst_eval.eval_merge(croped_imgs_dn)
                     
-                    detail_output = None
-                    denoise_output = None
+                    detail_out = None
+                    denoise_out = None
                     # 扛得住就pad再crop
                     if imgs_lr.shape[-1] % 16 != 0:
                         p2d = (4,4,4,4)
@@ -485,7 +500,7 @@ class SID_Trainer(Base_Trainer):
                             imgs_dn = self.net(imgs_lr)
 
                         if isinstance(imgs_dn, tuple) and len(imgs_dn) == 4:
-                            imgs_dn, texture_mask, detail_output, denoise_output = imgs_dn
+                            imgs_dn, texture_mask, detail_out, denoise_out = imgs_dn
                         else:
                             imgs_dn = imgs_dn
 
@@ -498,7 +513,7 @@ class SID_Trainer(Base_Trainer):
                             imgs_dn = self.net(imgs_lr)
 
                         if isinstance(imgs_dn, tuple) and len(imgs_dn) == 4:
-                            imgs_dn, texture_mask, detail_output, denoise_output = imgs_dn
+                            imgs_dn, texture_mask, detail_out, denoise_out = imgs_dn
                         else:
                             imgs_dn = imgs_dn
                     
@@ -522,6 +537,7 @@ class SID_Trainer(Base_Trainer):
                     target = tensor2im(imgs_hr)
                     res = quality_assess(output, target, data_range=255)
 
+
                     lpips_score = LPIPS_Metric(imgs_dn, imgs_hr, self.lpips_evaluator)
                     res['LPIPS'] = lpips_score.item()  # 添加到res字典中
                     
@@ -530,13 +546,38 @@ class SID_Trainer(Base_Trainer):
                     self.eval_ssim.update(res['SSIM'])
                     self.eval_lpips.update(res['LPIPS'])  # 新增
 
+                    # 计算细节路径的指标
+                    if detail_out is not None:
+                        detail_output = tensor2im(detail_out)   
+                        res_detail = quality_assess(detail_output, target, data_range=255)
+                        lpips_score_detail = LPIPS_Metric(detail_out, imgs_hr, self.lpips_evaluator)
+                        res_detail['LPIPS'] = lpips_score_detail.item()
+                        self.eval_lpips_detail.update(lpips_score_detail.item())
+                        raw_metrics = raw_metrics + [res_detail['PSNR'], res_detail['SSIM'], res_detail['LPIPS']]
+                        self.eval_psnr_detail.update(res_detail['PSNR'])
+                        self.eval_ssim_detail.update(res_detail['SSIM'])
+                    
+                    # 计算降噪路径的指标
+                    if denoise_out is not None:
+                        denoise_output = tensor2im(denoise_out)
+                        res_denoise = quality_assess(denoise_output, target, data_range=255)
+                        lpips_score_denoise = LPIPS_Metric(denoise_out, imgs_hr, self.lpips_evaluator)
+                        res_denoise['LPIPS'] = lpips_score_denoise.item()
+                        self.eval_lpips_denoise.update(lpips_score_denoise.item())
+                        raw_metrics = raw_metrics + [res_denoise['PSNR'], res_denoise['SSIM'], res_denoise['LPIPS']]
+                        self.eval_psnr_denoise.update(res_denoise['PSNR'])
+                        self.eval_ssim_denoise.update(res_denoise['SSIM'])
+
                     metrics[name] = raw_metrics
                     # convert raw to rgb
                     if save_plot:
                         if self.infos is None:
+                            lpips_score_input = LPIPS_Metric(imgs_lr, imgs_hr, self.lpips_evaluator)
+                            self.eval_lpips_lr.update(lpips_score_input.item())
                             inputs = tensor2im(imgs_lr)
                             res_in = quality_assess(inputs, target, data_range=255)
-                            raw_metrics = [res_in['PSNR'], res_in['SSIM']] + raw_metrics
+                            res_in['LPIPS'] = lpips_score_input.item()
+                            raw_metrics = [res_in['PSNR'], res_in['SSIM'],res_in['LPIPS']] + raw_metrics
                         else:
                             raw_metrics = [self.infos[k]['PSNR_raw'], self.infos[k]['SSIM_raw']] + raw_metrics
 
@@ -544,7 +585,7 @@ class SID_Trainer(Base_Trainer):
                             # self.multiprocess_plot(imgs_lr, imgs_dn, imgs_hr, 
                             #         wb, ccm, name, save_plot, epoch, raw_metrics, k)
                             pool.append(threading.Thread(target=self.multiprocess_plot, args=(imgs_lr, imgs_dn, imgs_hr, 
-                                    wb, ccm, name, save_plot, epoch, raw_metrics, k, denoise_output, detail_output)))
+                                    wb, ccm, name, save_plot, epoch, raw_metrics, k, denoise_out, detail_out)))
                             pool[k].start()
                         else:
                             infos = self.infos[k] if self.infos is not None else None
@@ -558,8 +599,8 @@ class SID_Trainer(Base_Trainer):
 
                             if 'isp' not in self.dst['command'].lower():
                                 output = raw2rgb_rawpy(imgs_dn, wb=wb, ccm=ccm)
-                                detail_rgb = raw2rgb_rawpy(detail_output, wb=wb, ccm=ccm) if detail_output is not None else None
-                                denoise_rgb = raw2rgb_rawpy(denoise_output, wb=wb, ccm=ccm) if denoise_output is not None else None
+                                detail_rgb = raw2rgb_rawpy(detail_out, wb=wb, ccm=ccm) if detail_out is not None else None
+                                denoise_rgb = raw2rgb_rawpy(denoise_out, wb=wb, ccm=ccm) if denoise_out is not None else None
 
                             # raw_metrics = None # 用RGB metrics
 
@@ -577,7 +618,7 @@ class SID_Trainer(Base_Trainer):
                                     filename=name, save_plot=save_plot, epoch=epoch,
                                     model_name=self.model_name, save_path=self.sample_dir,
                                     res=raw_metrics, detail_output=detail_rgb, denoise_output=denoise_rgb,
-                                    lpips_net=self.lpips_evaluator
+                                    lpips_net=None
                                 )
                             )
 
@@ -593,10 +634,17 @@ class SID_Trainer(Base_Trainer):
                 pool.shutdown(wait=True)
                 for task in as_completed(task_list):
                     psnr, ssim, lpips, name = task.result()  # 新增lpips
-                    metrics[name] = (psnr[1], ssim[1], lpips[1])  # 新增lpips[1]
+                    metrics[name] = (psnr[1], ssim[1], lpips[0])  # 新增lpips[1]
                     # if name[0] == '1' or self.dstname=='ELD':
                     self.eval_psnr_lr.update(psnr[0])
                     self.eval_psnr_dn.update(psnr[1])
+                    if detail_out is not None:
+                        self.eval_psnr_detail.update(psnr[2])
+                        self.eval_ssim_detail.update(ssim[2])
+                    if denoise_out is not None:
+                        self.eval_psnr_denoise.update(psnr[3])
+                        self.eval_ssim_denoise.update(ssim[3])
+
                     self.eval_ssim_lr.update(ssim[0])
                     self.eval_ssim_dn.update(ssim[1])
                     # === 新增：更新LPIPS统计器 ===
@@ -616,8 +664,11 @@ class SID_Trainer(Base_Trainer):
 
         log(f"Epoch {epoch}: PSNR={self.eval_psnr.avg:.2f}, lpips={self.eval_lpips.avg:.4f}\n"
             +f"psnrs_lr={self.eval_psnr_lr.avg:.2f}, psnrs_dn={self.eval_psnr_dn.avg:.2f}"
-            +f"\nssims_lr={self.eval_ssim_lr.avg:.4f}, ssims_dn={self.eval_ssim_dn.avg:.4f}",
-            +f"\n lpips_dn={self.eval_lpips_dn.avg:.4f}",
+            +f"\nssims_lr={self.eval_ssim_lr.avg:.4f}, ssims_dn={self.eval_ssim_dn.avg:.4f}"
+            +f"\nlpips_lr={self.eval_lpips_lr.avg:.4f}, lpips_dn={self.eval_lpips_dn.avg:.4f}"
+            +f"\npsnr_detail={self.eval_psnr_detail.avg:.4f}, psnr_denoise={self.eval_psnr_denoise.avg:.4f}"
+            +f"\nssims_detail={self.eval_ssim_detail.avg:.4f}, ssims_denoise={self.eval_ssim_denoise.avg:.4f}"
+            +f"\nlpips_lr={self.eval_lpips_detail.avg:.4f}, lpips_dn={self.eval_lpips_denoise.avg:.4f}",
             log=f'./logs/log_{self.model_name}.log')
         if epoch < 0:
             with open(metrics_path, 'wb') as f:
@@ -657,13 +708,20 @@ class SID_Trainer(Base_Trainer):
                     res=raw_metrics,
                     detail_output=detail_rgb,
                     denoise_output=denoise_rgb,
-                    lpips_net=self.lpips_evaluator)
+                    lpips_net=None
+                    )
         
         self.eval_psnr_lr.update(psnr[0])
         self.eval_psnr_dn.update(psnr[1])
         self.eval_ssim_lr.update(ssim[0])
         self.eval_ssim_dn.update(ssim[1])
         self.eval_lpips_dn.update(lpips[0])
+        if detail_out is not None:
+            self.eval_psnr_detail.update(psnr[2])
+            self.eval_ssim_detail.update(ssim[2])
+        if denoise_out is not None:
+            self.eval_psnr_denoise.update(psnr[3])
+            self.eval_ssim_denoise.update(ssim[3])
 
     def predict(self, raw, name='ds'):
         self.net.eval()
@@ -999,7 +1057,7 @@ if __name__ == '__main__':
         # 新格式：包含完整训练状态
         model_weights = best_model['model']
         log(f"加载新格式模型权重用于评估")
-        log(f"Epoch{best_model['epoch']}, Best_PSNR{best_model['best_psnr']}")
+        log(f"Epoch{best_model['epoch']}, Best_PSNR{best_model['eval_psnr']['avg']}")
     else:
         # 旧格式：仅包含模型权重
         model_weights = best_model

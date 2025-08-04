@@ -12,3 +12,12 @@ metrics/*
 trainer_raw_denoising copy.py
 data_process/Enhanced_Mix_Dataset copy.py
 runfiles/SonyA7S2/raw_denoising_enhanced copy.yml
+trainer_sid_ori.py
+op/data_process/Datasets.py
+op/data_process/get_dataset_infos.py
+op/data_process/process.py
+op/data_process/unprocess.py
+op/Net/DPL_Net.py
+op/training_pipeline/base_trainer.py
+op/training_pipeline/Trainer.py
+op/utils.py

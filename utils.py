@@ -609,26 +609,37 @@ def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
     else:
         # 使用预计算的输入和主输出指标
         psnr.append(res[0])  # 输入PSNR
-        psnr.append(res[2])  # 主输出PSNR
         ssim.append(res[1])  # 输入SSIM
-        ssim.append(res[3])  # 主输出SSIM
-        lpips.append(res[4])
+        lpips.append(res[2])
+        psnr.append(res[3])  # 主输出PSNR
+        ssim.append(res[4])  # 主输出SSIM
+        lpips.append(res[5])
+
+        if detail_output is not None:
+            psnr.append(res[6])  
+            ssim.append(res[7]) 
+            lpips.append(res[8]) 
+        if denoise_output is not None:
+            psnr.append(res[9])  
+            ssim.append(res[10]) 
+            lpips.append(res[11]) 
+
     
     # 计算细节路径的指标
-    if detail_output is not None:
-        psnr.append(compare_psnr(img_hr, detail_output))
-        ssim.append(compare_ssim(img_hr, detail_output, channel_axis=-1))
-    else:
-        psnr.append(-1)
-        ssim.append(-1)
+    # if detail_output is not None:
+    #     psnr.append(compare_psnr(img_hr, detail_output))
+    #     ssim.append(compare_ssim(img_hr, detail_output, channel_axis=-1))
+    # else:
+    #     psnr.append(-1)
+    #     ssim.append(-1)
     
     # 计算降噪路径的指标
-    if denoise_output is not None:
-        psnr.append(compare_psnr(img_hr, denoise_output))
-        ssim.append(compare_ssim(img_hr, denoise_output, channel_axis=-1))
-    else:
-        psnr.append(-1)
-        ssim.append(-1)
+    # if denoise_output is not None:
+    #     psnr.append(compare_psnr(img_hr, denoise_output))
+    #     ssim.append(compare_ssim(img_hr, denoise_output, channel_axis=-1))
+    # else:
+    #     psnr.append(-1)
+    #     ssim.append(-1)
                     
     # 创建场景专用目录
     scene_dir = os.path.join(save_path, f"scene_{filename}_Epoch{epoch}")
@@ -669,27 +680,27 @@ def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
                 current_pos = 1
                 plt.subplot(1, num_plots, current_pos)
                 plt.imshow(img_lr)
-                plt.title(f"Input\nPSNR: {psnr[0]:.2f} - SSIM: {ssim[0]:.4f}")
+                plt.title(f"Input\nPSNR:{psnr[0]:.2f}-SSIM:{ssim[0]:.4f}-lpips:{lpips[0]:.4f}")
                 plt.axis('off')
                 current_pos += 1
                 
                 if detail_output is not None:
                     plt.subplot(1, num_plots, current_pos)
                     plt.imshow(detail_output)
-                    plt.title(f"Detail Path\nPSNR: {psnr[2]:.2f} - SSIM: {ssim[2]:.4f}")
+                    plt.title(f"Detail Path\nPSNR:{psnr[2]:.2f}-SSIM:{ssim[2]:.4f}-lpips:{lpips[2]:.4f}")
                     plt.axis('off')
                     current_pos += 1
                 
                 if denoise_output is not None:
                     plt.subplot(1, num_plots, current_pos)
                     plt.imshow(denoise_output)
-                    plt.title(f"Denoise Path\nPSNR: {psnr[3]:.2f} - SSIM: {ssim[3]:.4f}")
+                    plt.title(f"Denoise Path\nPSNR:{psnr[3]:.2f}-SSIM:{ssim[3]:.4f}-lpips:{lpips[3]:.4f}")
                     plt.axis('off')
                     current_pos += 1
                 
                 plt.subplot(1, num_plots, current_pos)
                 plt.imshow(img_dn)
-                plt.title(f"{model_name}\nPSNR: {psnr[1]:.2f} - SSIM: {ssim[1]:.4f}")
+                plt.title(f"{model_name}\nPSNR:{psnr[1]:.2f}-SSIM:{ssim[1]:.4f}-lpips:{lpips[1]:.4f}")
                 plt.axis('off')
                 current_pos += 1
                 
@@ -703,35 +714,6 @@ def plot_sample_V2(img_lr, img_dn, img_hr, filename='result', model_name='Unet',
                 plt.close()  # 确保关闭图形
         except Exception as e:
             print(f"警告：保存比较图出错，但继续处理：{str(e)}")
-        
-        # 差异图处理（改为更简单的实现，避免matplotlib问题）
-        # if detail_output is not None and denoise_output is not None:
-        #     try:
-        #         # 计算差异图
-        #         detail_diff = np.abs(detail_output.astype(np.float32) - img_dn.astype(np.float32))
-        #         detail_diff = np.clip(detail_diff * 5, 0, 255).astype(np.uint8)
-                
-        #         denoise_diff = np.abs(denoise_output.astype(np.float32) - img_dn.astype(np.float32))
-        #         denoise_diff = np.clip(denoise_diff * 5, 0, 255).astype(np.uint8)
-                
-        #         path_diff = np.abs(detail_output.astype(np.float32) - denoise_output.astype(np.float32))
-        #         path_diff = np.clip(path_diff * 5, 0, 255).astype(np.uint8)
-                
-        #         # 直接保存差异图，不使用热图
-        #         cv2.imwrite(os.path.join(scene_dir, "diff_detail_main.png"), detail_diff[:,:,::-1])
-        #         cv2.imwrite(os.path.join(scene_dir, "diff_denoise_main.png"), denoise_diff[:,:,::-1])
-        #         cv2.imwrite(os.path.join(scene_dir, "diff_detail_denoise.png"), path_diff[:,:,::-1])
-                
-        #         # 转为灰度热图（使用OpenCV的归一化和着色而不是matplotlib）
-        #         detail_heat = cv2.applyColorMap(cv2.cvtColor(detail_diff, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_HOT)
-        #         denoise_heat = cv2.applyColorMap(cv2.cvtColor(denoise_diff, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_HOT)
-        #         path_heat = cv2.applyColorMap(cv2.cvtColor(path_diff, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_HOT)
-                
-        #         cv2.imwrite(os.path.join(scene_dir, "heat_detail_main.png"), detail_heat)
-        #         cv2.imwrite(os.path.join(scene_dir, "heat_denoise_main.png"), denoise_heat)
-        #         cv2.imwrite(os.path.join(scene_dir, "heat_detail_denoise.png"), path_heat)
-        #     except Exception as e:
-        #         print(f"警告：生成差异图出错，但继续处理：{str(e)}")
 
     return psnr, ssim, lpips, filename
 
