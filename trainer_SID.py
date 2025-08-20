@@ -113,10 +113,8 @@ class SID_Trainer(Base_Trainer):
         self.eval_ssim_dn = AverageMeter('SSIM', ':4f')
         # 添加LPIPS统计器 (仿照现有的eval_psnr)
         self.eval_lpips = AverageMeter('LPIPS', ':4f')      # 总体LPIPS
-        self.eval_lpips_lr = AverageMeter('LPIPS', ':4f') # 输入图像LPIPS  
+        self.eval_lpips_lr = AverageMeter('LPIPS_LR', ':4f') # 输入图像LPIPS  
         self.eval_lpips_dn = AverageMeter('LPIPS_DN', ':4f') # 输出图像LPIPS
-        self.eval_lpips_detail = AverageMeter('LPIPS', ':4f') # 输出图像LPIPS
-        self.eval_lpips_denoise = AverageMeter('LPIPS', ':4f') # 输出图像LPIPS
 
         # load weight
         resume_epoch = self.hyper.get('resume_from_epoch', 0)
@@ -270,8 +268,8 @@ class SID_Trainer(Base_Trainer):
                         if noise_map is not None:
                             outputs = self.net(imgs_lr, noise_map)
                             # 检查输出格式
-                            if isinstance(outputs, tuple) and len(outputs) == 4:
-                                main_output, texture_mask, detail_output, denoise_output = outputs
+                            if isinstance(outputs, tuple) and len(outputs) == 3:
+                                main_output, detail_output, denoise_output = outputs
                                 # 如果去噪没提前线性提亮，算loss的时候提亮上去
                                 if self.dst['ori'] is True:
                                     main_output = main_output * ratio
@@ -280,12 +278,13 @@ class SID_Trainer(Base_Trainer):
                                     if denoise_output is not None:
                                         denoise_output = denoise_output * ratio
                                 pred = main_output
+                                # loss, loss_values = self.l1loss(pred.clamp(0,1), imgs_hr)
                                 # 计算多损失
                                 loss, loss_values = self.compute_multi_loss(main_output, detail_output, denoise_output, imgs_hr)
                         else:
                             outputs = self.net(imgs_lr)
-                            if isinstance(outputs, tuple) and len(outputs) == 4:
-                                main_output, texture_mask, detail_output, denoise_output = outputs
+                            if isinstance(outputs, tuple) and len(outputs) == 3:
+                                main_output, detail_output, denoise_output = outputs
                                 # 如果去噪没提前线性提亮，算loss的时候提亮上去
                                 if self.dst['ori'] is True:
                                     main_output = main_output * ratio
@@ -309,6 +308,12 @@ class SID_Trainer(Base_Trainer):
                         
                         # === 使用正确的batch索引k进行监控 ===
                         warning_flag = self.physics_monitor.monitor_batch(loss_values, epoch, k)
+
+                    elif 'Freq' in self.arch['name']:
+                        pred = self.net(imgs_lr, noise_map)
+                        if self.dst['ori'] is True:
+                            pred = pred * ratio
+                        loss, loss_values = self.l1loss(pred.clamp(0,1), imgs_hr)
                             
                     else:
                         pred = self.net(imgs_lr)
@@ -414,23 +419,22 @@ class SID_Trainer(Base_Trainer):
             num_of_epochs = self.hyper['stop_epoch'] - self.hyper['last_epoch']
             T = self.hyper['T'] if 'T' in self.hyper else 1 
             period = num_of_epochs//T
-            if (self.hyper['last_epoch']+epoch) % period == 0:
-                model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
-                if os.path.exists(model_path):
-                    model = torch.load(model_path, map_location=self.device)
+            # if (self.hyper['last_epoch']+epoch) % period == 0:
+            #     model_path = os.path.join(f'{self.fast_ckpt}/{self.model_name}_best_model.pth')
+            #     if os.path.exists(model_path):
+            #         model = torch.load(model_path, map_location=self.device)
 
-                    # 检查加载的文件是新格式还是旧格式
-                    if isinstance(model, dict) and 'model' in model:
-                        # 新格式：包含完整训练状态
-                        model_weights = model['model']
-                        epoch = model['epoch']
-                    else:
-                        # 旧格式：仅包含模型权重
-                        model_weights = model
+            #         # 检查加载的文件是新格式还是旧格式
+            #         if isinstance(model, dict) and 'model' in model:
+            #             # 新格式：包含完整训练状态
+            #             model_weights = model['model']
+            #         else:
+            #             # 旧格式：仅包含模型权重
+            #             model_weights = model
 
-                    self.net = load_weights(self.net, model_weights, self.multi_gpu, by_name=True)
-                    log(f'Successfully reload best model (Epoch:{epoch}, Eval PSNR:{self.best_psnr})',
-                        log=f'./logs/log_{self.model_name}.log')
+            #         self.net = load_weights(self.net, model_weights, self.multi_gpu, by_name=True)
+            #         log(f'Successfully reload best model (Eval PSNR:{self.best_psnr})',
+            #             log=f'./logs/log_{self.model_name}.log')
 
     def eval(self, epoch=-1):
         self.net.eval()
@@ -449,8 +453,6 @@ class SID_Trainer(Base_Trainer):
         self.eval_lpips.reset()
         self.eval_lpips_lr.reset()
         self.eval_lpips_dn.reset()
-        self.eval_lpips_denoise.reset()
-        self.eval_lpips_detail.reset()
 
         # record every metric
         metrics = {}
@@ -499,8 +501,8 @@ class SID_Trainer(Base_Trainer):
                         else:
                             imgs_dn = self.net(imgs_lr)
 
-                        if isinstance(imgs_dn, tuple) and len(imgs_dn) == 4:
-                            imgs_dn, texture_mask, detail_out, denoise_out = imgs_dn
+                        if isinstance(imgs_dn, tuple) and len(imgs_dn) == 3:
+                            imgs_dn, detail_out, denoise_out = imgs_dn
                         else:
                             imgs_dn = imgs_dn
 
@@ -512,8 +514,8 @@ class SID_Trainer(Base_Trainer):
                         else:
                             imgs_dn = self.net(imgs_lr)
 
-                        if isinstance(imgs_dn, tuple) and len(imgs_dn) == 4:
-                            imgs_dn, texture_mask, detail_out, denoise_out = imgs_dn
+                        if isinstance(imgs_dn, tuple) and len(imgs_dn) == 3:
+                            imgs_dn, detail_out, denoise_out = imgs_dn
                         else:
                             imgs_dn = imgs_dn
                     
@@ -550,10 +552,7 @@ class SID_Trainer(Base_Trainer):
                     if detail_out is not None:
                         detail_output = tensor2im(detail_out)   
                         res_detail = quality_assess(detail_output, target, data_range=255)
-                        lpips_score_detail = LPIPS_Metric(detail_out, imgs_hr, self.lpips_evaluator)
-                        res_detail['LPIPS'] = lpips_score_detail.item()
-                        self.eval_lpips_detail.update(lpips_score_detail.item())
-                        raw_metrics = raw_metrics + [res_detail['PSNR'], res_detail['SSIM'], res_detail['LPIPS']]
+                        raw_metrics = raw_metrics + [res_detail['PSNR'], res_detail['SSIM']]
                         self.eval_psnr_detail.update(res_detail['PSNR'])
                         self.eval_ssim_detail.update(res_detail['SSIM'])
                     
@@ -561,10 +560,7 @@ class SID_Trainer(Base_Trainer):
                     if denoise_out is not None:
                         denoise_output = tensor2im(denoise_out)
                         res_denoise = quality_assess(denoise_output, target, data_range=255)
-                        lpips_score_denoise = LPIPS_Metric(denoise_out, imgs_hr, self.lpips_evaluator)
-                        res_denoise['LPIPS'] = lpips_score_denoise.item()
-                        self.eval_lpips_denoise.update(lpips_score_denoise.item())
-                        raw_metrics = raw_metrics + [res_denoise['PSNR'], res_denoise['SSIM'], res_denoise['LPIPS']]
+                        raw_metrics = raw_metrics + [res_denoise['PSNR'], res_denoise['SSIM']]
                         self.eval_psnr_denoise.update(res_denoise['PSNR'])
                         self.eval_ssim_denoise.update(res_denoise['SSIM'])
 
@@ -572,12 +568,9 @@ class SID_Trainer(Base_Trainer):
                     # convert raw to rgb
                     if save_plot:
                         if self.infos is None:
-                            lpips_score_input = LPIPS_Metric(imgs_lr, imgs_hr, self.lpips_evaluator)
-                            self.eval_lpips_lr.update(lpips_score_input.item())
                             inputs = tensor2im(imgs_lr)
                             res_in = quality_assess(inputs, target, data_range=255)
-                            res_in['LPIPS'] = lpips_score_input.item()
-                            raw_metrics = [res_in['PSNR'], res_in['SSIM'],res_in['LPIPS']] + raw_metrics
+                            raw_metrics = [res_in['PSNR'], res_in['SSIM']] + raw_metrics
                         else:
                             raw_metrics = [self.infos[k]['PSNR_raw'], self.infos[k]['SSIM_raw']] + raw_metrics
 
@@ -665,10 +658,9 @@ class SID_Trainer(Base_Trainer):
         log(f"Epoch {epoch}: PSNR={self.eval_psnr.avg:.2f}, lpips={self.eval_lpips.avg:.4f}\n"
             +f"psnrs_lr={self.eval_psnr_lr.avg:.2f}, psnrs_dn={self.eval_psnr_dn.avg:.2f}"
             +f"\nssims_lr={self.eval_ssim_lr.avg:.4f}, ssims_dn={self.eval_ssim_dn.avg:.4f}"
-            +f"\nlpips_lr={self.eval_lpips_lr.avg:.4f}, lpips_dn={self.eval_lpips_dn.avg:.4f}"
             +f"\npsnr_detail={self.eval_psnr_detail.avg:.4f}, psnr_denoise={self.eval_psnr_denoise.avg:.4f}"
             +f"\nssims_detail={self.eval_ssim_detail.avg:.4f}, ssims_denoise={self.eval_ssim_denoise.avg:.4f}"
-            +f"\nlpips_lr={self.eval_lpips_detail.avg:.4f}, lpips_dn={self.eval_lpips_denoise.avg:.4f}",
+            +f"\nlpips_dn={self.eval_lpips_dn.avg:.4f}",
             log=f'./logs/log_{self.model_name}.log')
         if epoch < 0:
             with open(metrics_path, 'wb') as f:
@@ -937,12 +929,12 @@ class SID_Trainer(Base_Trainer):
             self.net.load_state_dict(checkpoint['model'])
         
         # 加载优化器状态
-        if 'optimizer' in checkpoint:
-            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        # if 'optimizer' in checkpoint:
+        #     self.optimizer.load_state_dict(checkpoint['optimizer'])
         
-        # 加载学习率调度器
-        if 'scheduler' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        # # 加载学习率调度器
+        # if 'scheduler' in checkpoint:
+        #     self.scheduler.load_state_dict(checkpoint['scheduler'])
         
         # 加载训练指标
         if 'best_psnr' in checkpoint:
@@ -1047,9 +1039,9 @@ if __name__ == '__main__':
         trainer.eval_psnr.plot_history(savefile=os.path.join(trainer.sample_dir, f'{trainer.model_name}_eval_psnr.jpg'))
         trainer.mode = 'evaltest'
     # best_model
-    best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
-    if os.path.exists(best_model_path) is False: 
-        best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
+    # best_model_path = os.path.join(f'{trainer.fast_ckpt}', f'{trainer.model_name}_best_model.pth')
+    # if os.path.exists(best_model_path) is False: 
+    best_model_path = os.path.join(f'{trainer.fast_ckpt}',f'{trainer.model_name}_last_model.pth')
     best_model = torch.load(best_model_path, map_location=trainer.device)
 
     # 检查加载的文件是新格式还是旧格式

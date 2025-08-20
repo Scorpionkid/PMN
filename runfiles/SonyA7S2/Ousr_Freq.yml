@@ -1,0 +1,94 @@
+mode: 'evaltest'
+checkpoint: 'saved_model/'
+fast_ckpt: 'checkpoints/SonyA7S2'
+model_name: 'SonyA7S2_PMN_Unet_withAfreq'
+result_dir: 'images/'
+num_gpu: 1
+num_workers: 8
+brightness_correct: True
+
+dst: &base_dst 
+  root_dir: '/media/HDD2/personal_files/DenoisingDatasets/SID'
+  bias_dir: 'resources/SonyA7S2/BiasFrame_ET_1_30'
+  ds_dir: 'resources/SonyA7S2'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
+  command: 'augv2, idremap, darkshading2++, HB'
+  camera_type: 'SonyA7S2'
+  noise_code: 'pgrq'
+  patch_size: 512
+  H: 2848
+  W: 4256
+  crop_per_image: 8
+  croptype: 'non-overlapping'
+  wp: 16383
+  bl: 512
+  ori: False
+  clip: True
+  gpu_preprocess: True
+dst_train:
+  <<: *base_dst
+  mode: 'train'
+  dataset: 'Mix_Dataset' 
+  dstname: 'SID'
+dst_eval:
+  <<: *base_dst
+  root_dir: '/media/HDD2/personal_files/DenoisingDatasets/ELD'
+  mode: 'eval'
+  dataset: 'ELD_Dataset' 
+  dstname: 'ELD'
+  iso_list: [800, 1600, 3200]
+  ratio_list: [100, 200]
+  # specific_scenes: [1]  # 只测试scene-01，或者 ['scene-01']
+dst_test:
+  <<: *base_dst
+  mode: 'evaltest'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
+  # specific_images: ['10198']  # 指定要测试的图片名称
+
+arch:
+  name: 'UNetwFreq'
+  in_nc: 4
+  out_nc: 4
+  nf: 32
+  nframes: 1
+  use_dpsv: False
+  res: False
+  cascade: False
+  add: False
+  lock_wb: False
+
+
+hyper:
+  lr_scheduler: 'WarmupCosine'
+  learning_rate: 2.e-4
+  batch_size: 1
+  # last_epoch: 0
+  resume_from_epoch: 0
+  last_epoch: 0
+  step_size: 10
+  stop_epoch : 1800
+  T: 3
+  coldstart: False
+  num_workers: 8
+  num_gpus: 1
+  save_freq: 10
+  plot_freq: 100
+  best_psnr: 0.
+# hyper:
+#   lr_scheduler: 'WarmupCosine'
+#   learning_rate: 5.e-5
+#   batch_size: 1
+#   # last_epoch: 0
+#   resume_from_epoch: 1200
+#   last_epoch: 1200
+#   step_size: 10
+#   stop_epoch : 1800
+#   T: 1
+#   coldstart: False
+#   num_workers: 8
+#   num_gpus: 1
+#   save_freq: 10
+#   plot_freq: 100
+#   best_psnr: 48.52
