@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class FrequencyEnhancement(nn.Module):
     def __init__(self, channels):
@@ -28,3 +29,38 @@ class FrequencyEnhancement(nn.Module):
         output = torch.fft.irfft2(fft_fea, s=(H, W), norm='ortho')
         
         return output
+    
+class AdaptiveFreqEnhancement(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        # 轻量级的频率选择网络
+        self.freq_selector = nn.Sequential(
+            nn.Conv2d(channels, channels//reduction, 1),
+            nn.ReLU(),
+            nn.Conv2d(channels//reduction, channels, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x, noise_level=None):
+        # FFT变换
+        freq = torch.fft.rfft2(x, norm='ortho')
+        
+        # 基于噪声水平的自适应频率选择
+        if noise_level is not None:
+            # 噪声越大，保留的高频越少
+            freq_mask = self.freq_selector(noise_level)
+            freq = freq * freq_mask
+        
+        # 增强中低频，抑制高频噪声
+        freq_magnitude = torch.abs(freq)
+        freq_phase = torch.angle(freq)
+        
+        # 软阈值处理
+        threshold = self.adaptive_threshold(freq_magnitude, noise_level)
+        freq_magnitude = F.relu(freq_magnitude - threshold) + threshold
+        
+        # 重构
+        freq_complex = freq_magnitude * torch.exp(1j * freq_phase)
+        enhanced = torch.fft.irfft2(freq_complex, s=x.shape[-2:], norm='ortho')
+        
+        return enhanced
