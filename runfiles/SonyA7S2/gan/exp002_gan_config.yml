@@ -1,0 +1,249 @@
+# ========================================
+# 实验-002: DualPathNet对抗训练配置
+# ========================================
+# 通过引入对抗训练机制来改进DualPathNet架构，
+# 提高生成图像的感知质量，特别是纹理和边缘等高频细节
+
+mode: 'train'
+checkpoint: 'saved_model/'
+fast_ckpt: 'checkpoints/SonyA7S2'
+
+# 预训练模型路径 - 从DualPathNet baseline开始
+pretrained_model: 'checkpoints/SonyA7S2_DPL_30M_baseline_best_model.pth'
+
+# 实验名称
+model_name: 'SonyA7S2_DualPathNet_GAN_Exp003'
+result_dir: 'images/'
+num_gpu: 1
+num_workers: 8
+brightness_correct: True
+
+# ========================================
+# 数据集配置
+# ========================================
+dst: &base_dst 
+  root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/SID'
+  bias_dir: 'resources/SonyA7S2/BiasFrame_ET_1_30'
+  ds_dir: 'resources/SonyA7S2'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
+  command: 'augv2, idremap, darkshading2++, HB'
+  camera_type: 'SonyA7S2'
+  noise_code: 'pgrq'
+  patch_size: 256  # 对抗训练建议使用较小的patch以节省显存
+  H: 2848
+  W: 4256
+  crop_per_image: 8  # 增加crop数量以获得更多样本
+  croptype: 'random'  # 使用随机裁剪增加多样性
+  wp: 16383
+  bl: 512
+  ori: False
+  clip: True
+  gpu_preprocess: True
+
+dst_train:
+  <<: *base_dst
+  mode: 'train'
+  dataset: 'Mix_Dataset' 
+  dstname: 'SID'
+
+dst_eval:
+  <<: *base_dst
+  root_dir: '/media/HDD3/personal_files/zhouzhou/VideoDenoisingDatasets/ELD/ELD'
+  mode: 'eval'
+  dataset: 'ELD_Dataset' 
+  dstname: 'ELD'
+  iso_list: [800, 1600, 3200]
+  ratio_list: [100, 200]
+  patch_size: 512  # 评估时使用较大的patch
+  specific_scenes:
+
+dst_test:
+  <<: *base_dst
+  mode: 'evaltest'
+  dataset: 'SID_Dataset' 
+  dstname: 'SID'
+  specific_images:
+
+# ========================================
+# 生成器架构 (DualPathNet)
+# ========================================
+arch:
+  name: 'DPNet_E1'
+  in_channels: 4
+  out_channels: 4
+  nf: 48
+  use_dpsv: False
+  res: False
+  cascade: False
+  add: False
+  lock_wb: False
+  heads: [1, 2, 4, 8]
+  dilated_rates: [1, 2, 4, 8]
+  use_wavelet_upsample: False
+  use_sharpness_recovery: True
+  use_noise_map: True
+  use_texture_detection: True
+  enable_intermediate_supervision: True  
+  use_depthwise_separable: False
+
+# ========================================
+# 判别器架构配置
+# ========================================
+discriminator:
+  # 判别器类型: 'multiscale_vgg_freq' 或 'simple_multiscale'
+  type: 'multiscale_vgg_freq'  
+  
+  # MultiScaleVGGFreqDiscriminator配置
+  in_channels: 4
+  nf: 64
+  num_scales: 2  # 多尺度数量 (原始尺度 + 2个下采样尺度)
+  vgg_layers: [2, 7]  # 使用的VGG层
+  use_freq_discriminator: True  # 是否启用频域判别头
+  
+  # 如果使用simple_multiscale判别器 (计算资源受限时)
+  # type: 'simple_multiscale'
+  # in_channels: 4
+  # nf: 64
+  # num_scales: 3
+
+# ========================================
+# 损失函数配置
+# ========================================
+loss:
+  # 基础损失
+  pixel_loss: True       # L1像素损失
+  perceptual: True       # VGG感知损失
+  gradient: True         # 梯度/边缘损失
+  multiloss: True        # 多路径监督损失
+  
+  # 对抗损失
+  adversarial: True      # 启用对抗损失
+  
+  # GAN配置
+  gan:
+    type: 'vanilla'      # GAN类型: 'vanilla', 'lsgan', 'wgan', 'hinge'
+    # type: 'lsgan'      # 推荐使用LSGAN，训练更稳定
+    real_label_val: 1.0
+    fake_label_val: 0.0
+  
+  # 损失权重
+  weights:
+    pixel: 1.0           # 像素损失权重
+    perceptual: 0.1      # 感知损失权重
+    gradient: 0.5        # 梯度损失权重
+    adversarial: 0.01    # 对抗损失权重 (初始值，会动态调整)
+    detail_path: 0.5     # 细节路径中间监督权重
+    denoise_path: 0.5    # 降噪路径中间监督权重
+  
+  # 对抗损失动态权重调整
+  adversarial_schedule:
+    enabled: True
+    warmup_epochs: 50    # 前50个epoch不使用对抗损失
+    rampup_epochs: 100   # 50-150 epoch线性增加对抗损失权重
+    max_weight: 0.05     # 对抗损失最大权重
+    min_weight: 0.001    # 对抗损失最小权重
+
+# ========================================
+# 训练超参数
+# ========================================
+hyper:
+  # 学习率和调度器
+  lr_scheduler: 'WarmupCosine'
+  learning_rate: 2.e-4      # 生成器学习率
+  learning_rate_d: 1.e-4      # 判别器学习率 (通常比生成器小)
+  
+  # 训练配置
+  batch_size: 1               # 对抗训练建议使用较小batch size
+  resume_from_epoch: 0
+  last_epoch: 0
+  step_size: 10
+  stop_epoch: 1500            # 总训练epoch
+  
+  # 其他配置
+  T: 3
+  coldstart: False
+  num_workers: 8
+  num_gpus: 1
+  
+  # 保存和评估频率
+  save_freq: 50
+  plot_freq: 100               # 每50 epoch评估一次
+  best_psnr: 0.
+  
+  # 对抗训练特定配置
+  gan_training:
+    n_critic: 1               # 每训练1次生成器，训练n_critic次判别器
+    clip_grad_norm: 1.0       # 梯度裁剪
+    use_gradient_penalty: False  # 是否使用梯度惩罚(WGAN-GP)
+    gp_weight: 10.0           # 梯度惩罚权重
+    
+    # 判别器更新策略
+    discriminator_update:
+      start_epoch: 0          # 从第几个epoch开始更新判别器
+      update_freq: 1          # 每隔多少步更新一次判别器
+    
+    # 生成器更新策略  
+    generator_update:
+      start_epoch: 0          # 从第几个epoch开始更新生成器
+      update_freq: 1          # 每隔多少步更新一次生成器
+
+# ========================================
+# 实验追踪和日志
+# ========================================
+logging:
+  use_tensorboard: True
+  log_dir: 'logs/tensorboard'
+  
+  # 记录的指标
+  metrics:
+    - 'g_loss'              # 生成器总损失
+    - 'd_loss'              # 判别器总损失
+    - 'g_pixel_loss'        # 生成器像素损失
+    - 'g_perceptual_loss'   # 生成器感知损失
+    - 'g_adversarial_loss'  # 生成器对抗损失
+    - 'd_real_loss'         # 判别器真实样本损失
+    - 'd_fake_loss'         # 判别器生成样本损失
+    - 'psnr'                # PSNR
+    - 'ssim'                # SSIM
+  
+  # 可视化频率
+  vis_freq: 100             # 每100 iter保存一次可视化结果
+  
+# ========================================
+# 可选: 特征匹配损失 (提高训练稳定性)
+# ========================================
+feature_matching:
+  enabled: True
+  weight: 10.0
+  layers: ['layer_2', 'layer_7', 'layer_12']  # 使用哪些VGG层的特征
+
+# ========================================
+# 可选: 渐进式训练策略
+# ========================================
+progressive_training:
+  enabled: False
+  stages:
+    - epochs: 200
+      patch_size: 128
+      batch_size: 8
+    - epochs: 400
+      patch_size: 256
+      batch_size: 4
+    - epochs: 1500
+      patch_size: 512
+      batch_size: 2
+
+# ========================================
+# 备注
+# ========================================
+# 实验目标:
+# 1. 提高生成图像的感知质量
+# 2. 更好地保留纹理和边缘细节
+# 3. 提高高频信息的恢复能力
+# 
+# 关键策略:
+# 1. 多尺度VGG特征判别 - 捕获不同层次的特征
+# 2. 频域判别 - 关注高频细节
+# 3. 渐进式对抗损失权重 - 稳定训练过程
+# 4. 判别器多层输出 - 提供更丰富的梯度信号
